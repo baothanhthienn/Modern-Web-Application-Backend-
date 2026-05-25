@@ -64,7 +64,7 @@ export function createApp({
     },
   });
 
-  if (config.isProduction) {
+  if (config.isHosted) {
     app.set('trust proxy', 1);
   }
 

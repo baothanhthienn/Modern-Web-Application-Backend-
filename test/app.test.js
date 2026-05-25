@@ -26,6 +26,27 @@ const publicProfile = {
   communities: [],
 };
 
+describe('deployment configuration', () => {
+  it('defaults Railway sessions to cross-site secure cookies without relying on NODE_ENV', () => {
+    const config = createConfig({
+      RAILWAY_ENVIRONMENT_NAME: 'production',
+      FRONTEND_ORIGIN: 'https://frontend.example',
+    });
+
+    assert.equal(config.isHosted, true);
+    assert.equal(config.cookieSecure, true);
+    assert.equal(config.cookieSameSite, 'none');
+  });
+
+  it('retains lax non-secure cookie defaults for local development', () => {
+    const config = createConfig({ FRONTEND_ORIGIN: 'http://localhost:5173' });
+
+    assert.equal(config.isHosted, false);
+    assert.equal(config.cookieSecure, false);
+    assert.equal(config.cookieSameSite, 'lax');
+  });
+});
+
 function setup(authOverrides = {}, profileOverrides = {}, serviceOverrides = {}) {
   const calls = [];
   const profileCalls = [];

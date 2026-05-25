@@ -145,6 +145,35 @@ For a separately hosted frontend and API:
 - Backend must use `COOKIE_SECURE=true` and `COOKIE_SAME_SITE=none`.
 - Frontend requests must use `credentials: 'include'`.
 
+### Diagnosing `401` In Deployment
+
+A browser console message saying a resource returned `401` is not enough to
+identify a backend fault. Inspect the failed request URL and JSON body:
+
+| Request | When `401` Is Expected |
+| --- | --- |
+| `GET /api/auth/session` | A guest opens the application or a saved session expired. The frontend should clear auth state without showing a fatal error. |
+| `GET /api/me/saved` | A user is not logged in but attempts to view Saved. |
+| `GET /api/notifications` | A user is not logged in but attempts to load notifications. |
+| Socket.IO connection | The chat socket was created without a current login session cookie. Do not connect chat for guest users. |
+
+If `POST /api/auth/login` returns `200` but the immediately following
+`GET /api/auth/session`, notifications request, or chat socket fails with
+`401`, the browser did not store or send the session cookie. For a frontend
+and Railway API on different sites, verify:
+
+```text
+FRONTEND_ORIGIN=https://<exact-frontend-domain>
+COOKIE_SECURE=true
+COOKIE_SAME_SITE=none
+```
+
+Railway runtime variables are now detected automatically so deployed session
+cookies default to `Secure` and `SameSite=None` even when `NODE_ENV` was not
+set. Explicit `COOKIE_*` variables still override those defaults. The
+frontend must continue using `credentials: 'include'` for API requests and
+`withCredentials: true` for Socket.IO.
+
 ## API Endpoints
 
 ### Register
@@ -950,8 +979,8 @@ Relevant backend environment variables:
 | `NODE_ENV` | `production` |
 | `DATABASE_URL` | Private PostgreSQL connection string. Never expose to frontend code. |
 | `FRONTEND_ORIGIN` | `https://your-frontend.example` |
-| `COOKIE_SECURE` | `true` for HTTPS deployment. |
-| `COOKIE_SAME_SITE` | `none` when frontend and API are on separate sites. |
+| `COOKIE_SECURE` | `true` for HTTPS deployment. This is the Railway default unless overridden. |
+| `COOKIE_SAME_SITE` | `none` when frontend and API are on separate sites. This is the Railway default unless overridden. |
 | `SESSION_COOKIE_NAME` | Optional; default `reddit_session`. |
 | `SESSION_TTL_SECONDS` | Optional; default `2592000` (30 days). |
 | `PROFILE_READ_RATE_LIMIT` | Optional; default `120` public/profile reads per window. |
