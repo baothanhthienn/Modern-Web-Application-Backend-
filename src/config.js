@@ -36,8 +36,9 @@ export function createConfig(env = process.env) {
     sessionTtlMs: integerValue(env.SESSION_TTL_SECONDS, 30 * 24 * 60 * 60) * 1000,
     cookieSecure: booleanValue(env.COOKIE_SECURE, isProduction),
     cookieSameSite: sameSite,
+    profileReadRateLimit: integerValue(env.PROFILE_READ_RATE_LIMIT, 120),
+    profileReadRateWindowMs: integerValue(env.PROFILE_READ_RATE_WINDOW_SECONDS, 60) * 1000,
   };
 }
 
 export const config = createConfig();
-

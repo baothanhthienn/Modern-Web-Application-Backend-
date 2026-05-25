@@ -1,67 +1,95 @@
-# Modern Web Application Backend
+# Modern Web Application Backend API
 
-Express authentication API for a Vue frontend, backed by PostgreSQL and
-designed for deployment on Railway.
+This repository contains the Express authentication API for the frontend
+application. It replaces PHP authentication endpoints with a JSON API intended
+for Railway deployment and a PostgreSQL database.
 
-## Features
+This document is the integration contract for frontend work.
 
-- JSON API responses, including failures.
-- Registration and login with bcrypt password hashing.
-- `HttpOnly` cookie sessions with only SHA-256 token hashes stored in the
-  database.
-- Credentialed CORS restricted to configured frontend origins.
-- PostgreSQL schema migration and API contract tests.
+## What The API Does
 
-## Setup
+The API provides:
 
-Requires Node.js 20 or later.
+- User registration.
+- Login with either username or email.
+- Cookie-based authenticated session restoration after a page reload.
+- Logout and server-side session invalidation.
+- Public user profiles and public activity reads.
+- Authenticated access to the current user's saved-items tab.
+- Home feed retrieval with `best`, `hot`, `new`, `top`, and `rising` sorting.
+- Persisted low-level post writing, voting, and saving.
+- Username and post-title search.
+- Community joining and member-only realtime community chat.
+- Mutual-follow realtime direct chat.
+- Notifications and signed-in username editing.
+- A database health check for deployment verification.
 
-```bash
-npm install
-cp .env.example .env
-npm run db:migrate
-npm run dev
-```
+Passwords are hashed on the server with bcrypt. Authentication uses an
+`HttpOnly` session cookie, so frontend code never reads or stores the raw
+session token. The database stores only a SHA-256 hash of that token.
 
-Set `DATABASE_URL` in `.env` locally and in Railway environment variables for
-deployment. Never expose it through a `VITE_*` variable or commit `.env`.
+## Frontend Integration Summary
 
-For a separately deployed frontend, set:
-
-```text
-FRONTEND_ORIGIN=https://your-frontend.example
-COOKIE_SECURE=true
-COOKIE_SAME_SITE=none
-```
-
-The frontend public configuration should contain only:
+Set the frontend's public API configuration to the deployed backend:
 
 ```text
-VITE_API_BASE_URL=https://your-api.example/api
+VITE_API_BASE_URL=https://<railway-api-domain>/api
 ```
 
-and cross-origin browser requests must use `credentials: 'include'`.
-
-## Commands
-
-```bash
-npm test            # Run endpoint contract tests
-npm run db:migrate  # Create PostgreSQL users/session tables
-npm start           # Start the HTTP server
-```
-
-## Endpoints
+For local development:
 
 ```text
-GET  /api/health
+VITE_API_BASE_URL=http://localhost:3000/api
+```
+
+All frontend authentication requests must include credentials:
+
+```js
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
+
+const response = await fetch(`${API_BASE_URL}/auth/session`, {
+  credentials: 'include',
+});
+```
+
+Use clean Express routes only. Do not call any former `.php` routes.
+
+```text
 POST /api/auth/register
 POST /api/auth/login
 GET  /api/auth/session
 POST /api/auth/logout
+GET  /api/profiles/:username
+GET  /api/profiles/:username/activity?type=overview&limit=20&cursor=<cursor>
+GET  /api/me/saved?limit=20&cursor=<cursor>
+GET  /api/posts?sort=best&limit=20&cursor=<cursor>
+POST /api/posts
+GET  /api/posts/:postId
+PUT  /api/posts/:postId/vote
+PUT  /api/posts/:postId/saved
+DELETE /api/posts/:postId/saved
+GET  /api/search?q=<text>&limit=10
+GET  /api/communities
+POST /api/communities/:name/join
+DELETE /api/communities/:name/join
+POST /api/profiles/:username/follow
+DELETE /api/profiles/:username/follow
+GET  /api/chats/communities/:name/messages
+GET  /api/chats/users/:username/messages
+GET  /api/notifications
+PATCH /api/me/username
+GET  /api/health
 ```
 
-Registration accepts `username`, `email`, and `password`. Login accepts
-`identifier` (username or email) and `password`. Authentication responses use:
+## Response Conventions
+
+Every API response is JSON. A successful response contains:
+
+```json
+{ "success": true }
+```
+
+or, for endpoints returning the authenticated user:
 
 ```json
 {
@@ -75,9 +103,860 @@ Registration accepts `username`, `email`, and `password`. Login accepts
 }
 ```
 
-## Railway
+An unsuccessful response contains:
 
-Set `NODE_ENV=production`, `DATABASE_URL`, `FRONTEND_ORIGIN`,
-`COOKIE_SECURE=true`, and `COOKIE_SAME_SITE=none` for a cross-site frontend.
-Railway supplies `PORT` when running the service. Run `npm run db:migrate`
-against the production database before using authentication endpoints.
+```json
+{
+  "success": false,
+  "error": "A user-facing error message."
+}
+```
+
+During local backend development only, unexpected `500` responses may also
+include a `details` string. The frontend should not depend on `details` or
+show it to users.
+
+### User Object
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | number | Database user identifier. |
+| `username` | string | Registered display/login username. |
+| `email` | string | Registered email address, stored lowercase. |
+| `joinDate` | string | ISO 8601 timestamp for account creation. |
+
+## Authentication And Cookies
+
+Registration and login set the configured session cookie, named
+`reddit_session` by default. The cookie is:
+
+- `HttpOnly`, so JavaScript cannot access it.
+- Sent for `/` requests.
+- Valid for 30 days by default.
+- `Secure` and `SameSite=None` in a cross-site production frontend/API setup.
+
+The frontend should store user display state only if needed for immediate UI
+rendering. It must treat `GET /api/auth/session` as the authoritative way to
+confirm authentication after reload.
+
+For a separately hosted frontend and API:
+
+- Backend must set `FRONTEND_ORIGIN` to the exact frontend origin.
+- Backend must use `COOKIE_SECURE=true` and `COOKIE_SAME_SITE=none`.
+- Frontend requests must use `credentials: 'include'`.
+
+## API Endpoints
+
+### Register
+
+Creates a user account, immediately creates a session, and sets the session
+cookie.
+
+```http
+POST /api/auth/register
+Content-Type: application/json
+```
+
+Request body:
+
+```json
+{
+  "username": "sample_user",
+  "email": "sample@example.com",
+  "password": "Password1"
+}
+```
+
+Validation rules:
+
+| Field | Rules |
+| --- | --- |
+| `username` | 3 to 20 letters, numbers, or underscores. |
+| `email` | Valid email format, maximum 191 characters; normalized to lowercase. |
+| `password` | At least 8 characters, including uppercase, lowercase, and a number. |
+
+Success, `201 Created`:
+
+```json
+{
+  "success": true,
+  "user": {
+    "id": 1,
+    "username": "sample_user",
+    "email": "sample@example.com",
+    "joinDate": "2026-05-25T00:00:00.000Z"
+  }
+}
+```
+
+Validation failures, `400 Bad Request`:
+
+```json
+{ "success": false, "error": "Enter a valid email address." }
+```
+
+```json
+{ "success": false, "error": "Username must be 3-20 letters, numbers, or underscores." }
+```
+
+```json
+{ "success": false, "error": "Password must be 8+ characters with uppercase, lowercase, and a number." }
+```
+
+Duplicate account, `409 Conflict`:
+
+```json
+{ "success": false, "error": "That username or email is already registered." }
+```
+
+Frontend example:
+
+```js
+export async function register({ username, email, password }) {
+  const response = await fetch(`${API_BASE_URL}/auth/register`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, email, password }),
+  });
+
+  return response.json();
+}
+```
+
+### Login
+
+Authenticates an existing user by username or email, creates a new session,
+and sets the session cookie.
+
+```http
+POST /api/auth/login
+Content-Type: application/json
+```
+
+Request body:
+
+```json
+{
+  "identifier": "sample_user",
+  "password": "Password1"
+}
+```
+
+`identifier` may contain the username or email. Email login is normalized to
+lowercase by the API.
+
+Success, `200 OK`:
+
+```json
+{
+  "success": true,
+  "user": {
+    "id": 1,
+    "username": "sample_user",
+    "email": "sample@example.com",
+    "joinDate": "2026-05-25T00:00:00.000Z"
+  }
+}
+```
+
+Missing or invalid credentials, `401 Unauthorized`:
+
+```json
+{ "success": false, "error": "Invalid username, email, or password." }
+```
+
+Frontend example:
+
+```js
+export async function login({ identifier, password }) {
+  const response = await fetch(`${API_BASE_URL}/auth/login`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ identifier, password }),
+  });
+
+  return response.json();
+}
+```
+
+### Restore Current Session
+
+Checks the browser's session cookie and returns the authenticated user. Call
+this during application startup to restore login state.
+
+```http
+GET /api/auth/session
+```
+
+Success, `200 OK`:
+
+```json
+{
+  "success": true,
+  "user": {
+    "id": 1,
+    "username": "sample_user",
+    "email": "sample@example.com",
+    "joinDate": "2026-05-25T00:00:00.000Z"
+  }
+}
+```
+
+No cookie, expired session, or invalid session, `401 Unauthorized`:
+
+```json
+{ "success": false, "error": "Session expired or invalid." }
+```
+
+Frontend example:
+
+```js
+export async function restoreAuthSession() {
+  const response = await fetch(`${API_BASE_URL}/auth/session`, {
+    credentials: 'include',
+  });
+
+  return response.json();
+}
+```
+
+### Logout
+
+Invalidates the current session in PostgreSQL and clears the browser cookie.
+Logout is safe to call even when no session cookie is present.
+
+```http
+POST /api/auth/logout
+```
+
+Success, `200 OK`:
+
+```json
+{ "success": true }
+```
+
+Frontend example:
+
+```js
+export async function logout() {
+  const response = await fetch(`${API_BASE_URL}/auth/logout`, {
+    method: 'POST',
+    credentials: 'include',
+  });
+
+  return response.json();
+}
+```
+
+### Health Check
+
+Confirms that the Express API can query PostgreSQL. This route is intended for
+deployment checks and service monitoring, not frontend authentication state.
+
+```http
+GET /api/health
+```
+
+Success, `200 OK`:
+
+```json
+{
+  "success": true,
+  "database": "connected",
+  "databaseName": "railway",
+  "serverVersion": "PostgreSQL ..."
+}
+```
+
+## Public Profile API
+
+Profile routes support the public `/profile/:username` page. They never return
+registration email, session data, or private account information. The
+frontend should still include credentials so the response can identify whether
+the current viewer owns the displayed profile.
+
+### Get Public Profile
+
+```http
+GET /api/profiles/sample_user
+```
+
+Success, `200 OK`:
+
+```json
+{
+  "success": true,
+  "profile": {
+    "username": "sample_user",
+    "displayName": null,
+    "bio": null,
+    "avatarUrl": null,
+    "bannerColor": null,
+    "postKarma": 0,
+    "commentKarma": 0,
+    "followers": 0,
+    "cakeDay": "2026-05-25T00:00:00.000Z",
+    "communities": []
+  },
+  "viewer": {
+    "isAuthenticated": false,
+    "isSelf": false,
+    "isFollowing": false,
+    "canMessage": false
+  }
+}
+```
+
+`username` is resolved case-insensitively and returned in its registered
+canonical form. The optional public profile fields are sourced from
+`user_profiles`:
+
+| Field | Type | Rules |
+| --- | --- | --- |
+| `displayName` | string or `null` | Maximum 50 characters. |
+| `bio` | string or `null` | Maximum 200 characters. |
+| `avatarUrl` | string or `null` | Stored only as an HTTPS URL. |
+| `bannerColor` | string or `null` | Hex color in `#RRGGBB` form. |
+
+`postKarma` is currently calculated from the signed-in user's public post
+scores. `followers` is counted from follows, and `communities` contains up to
+five joined communities. There is not yet a comment-writing API, so
+`commentKarma` currently returns `0`.
+
+When a valid session cookie is included, `viewer.isAuthenticated` is `true`,
+`viewer.isSelf` identifies the signed-in user's own profile,
+`viewer.isFollowing` reflects the current user's follow record, and
+`viewer.canMessage` is `true` only when viewing another user. A direct chat
+still requires both users to follow each other.
+
+Unknown username, `404 Not Found`:
+
+```json
+{ "success": false, "error": "Profile not found." }
+```
+
+Frontend example:
+
+```js
+export async function getPublicProfile(username) {
+  const response = await fetch(`${API_BASE_URL}/profiles/${encodeURIComponent(username)}`, {
+    credentials: 'include',
+  });
+
+  return response.json();
+}
+```
+
+### Get Public Activity
+
+```http
+GET /api/profiles/sample_user/activity?type=overview&limit=20
+```
+
+Accepted query parameters:
+
+| Parameter | Accepted Values | Default |
+| --- | --- | --- |
+| `type` | `overview`, `posts`, `comments` | `overview` |
+| `limit` | Integer from `1` to `50` | `20` |
+| `cursor` | Non-empty opaque string from a preceding response | none |
+
+`posts` and `overview` return the user's persisted public posts. There is not
+yet a comment-writing API, so `comments` currently returns an empty list.
+
+An empty response has this shape:
+
+```json
+{
+  "success": true,
+  "items": [],
+  "nextCursor": null
+}
+```
+
+The result shape is ready for future `post` and `comment` items without
+changing frontend pagination. A request for `type=saved` is never public:
+
+```json
+{ "success": false, "error": "Saved activity is private." }
+```
+
+This response uses `400 Bad Request`. Unknown profile usernames return the
+same `404` profile-not-found response as the profile endpoint.
+
+### Get Own Saved Items
+
+```http
+GET /api/me/saved?limit=20&cursor=<cursor>
+```
+
+This endpoint requires a valid signed-in session and uses the same pagination
+shape as public activity. It returns posts persisted through the save endpoint.
+When there are no saved posts, the response is:
+
+```json
+{
+  "success": true,
+  "items": [],
+  "nextCursor": null
+}
+```
+
+No valid session, `401 Unauthorized`:
+
+```json
+{ "success": false, "error": "You must be logged in to view saved posts." }
+```
+
+Frontend example:
+
+```js
+export async function getSavedItems({ limit = 20, cursor } = {}) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cursor) params.set('cursor', cursor);
+
+  const response = await fetch(`${API_BASE_URL}/me/saved?${params}`, {
+    credentials: 'include',
+  });
+
+  return response.json();
+}
+```
+
+## Home Feed And Posts API
+
+### Feed
+
+The home page loads persisted public posts through:
+
+```http
+GET /api/posts?sort=best&limit=20&cursor=<opaque-cursor>
+```
+
+`sort` accepts `best`, `hot`, `new`, `top`, and `rising`. The default is
+`best`. `limit` defaults to `20` and is restricted to `1` through `50`.
+
+Successful response, `200 OK`:
+
+```json
+{
+  "success": true,
+  "posts": [
+    {
+      "id": 1,
+      "community": "technology",
+      "communityColor": "#A855F7",
+      "author": "tech_guru",
+      "createdAt": "2026-05-25T03:15:00.000Z",
+      "flair": null,
+      "flairColor": null,
+      "title": "New breakthrough in quantum computing announced today",
+      "image": "https://images.example/post.jpg",
+      "text": "Description supplied by the author.",
+      "link": null,
+      "linkDomain": null,
+      "votes": 0,
+      "comments": 0,
+      "reactions": 0,
+      "userVote": 0,
+      "saved": false
+    }
+  ],
+  "nextCursor": null
+}
+```
+
+The backend returns `createdAt`, not text such as `"5 hours ago"`; the
+frontend formats relative display time. `userVote` and `saved` are populated
+for a valid included session cookie and use default values for anonymous
+visitors. `votes` is a net score and may be negative.
+
+### Create Post
+
+The initial post writer supports a title, one HTTPS image URL, and text
+description. A community is required so the post can be displayed in the
+feed. The user must be logged in.
+
+```http
+POST /api/posts
+Content-Type: application/json
+```
+
+```json
+{
+  "community": "technology",
+  "title": "New breakthrough in quantum computing announced today",
+  "image": "https://images.example/post.jpg",
+  "description": "A closer look at what this change means."
+}
+```
+
+Success, `201 Created`:
+
+```json
+{
+  "success": true,
+  "post": {
+    "id": 1,
+    "community": "technology",
+    "author": "tech_guru",
+    "title": "New breakthrough in quantum computing announced today",
+    "image": "https://images.example/post.jpg",
+    "text": "A closer look at what this change means.",
+    "votes": 0,
+    "comments": 0,
+    "reactions": 0,
+    "userVote": 0,
+    "saved": false
+  }
+}
+```
+
+Creating a post also inserts a `post_created` notification for the author.
+Only HTTPS image URLs are accepted. Link posts, post editing, comments, and
+reactions are reserved for later endpoints.
+
+### Post Viewer Actions
+
+```http
+GET    /api/posts/:postId
+PUT    /api/posts/:postId/vote
+PUT    /api/posts/:postId/saved
+DELETE /api/posts/:postId/saved
+```
+
+Voting and saving require authentication. Vote body:
+
+```json
+{ "vote": 1 }
+```
+
+Values are `1` for upvote, `-1` for downvote, and `0` to remove the current
+vote. Each success returns `{ "success": true, "post": <post-object> }`.
+
+## Search API
+
+The home search matches canonical usernames and public post titles:
+
+```http
+GET /api/search?q=tech&limit=10
+```
+
+`q` is required and must be 2 to 100 characters. `limit` defaults to `10` and
+has a maximum of `20`.
+
+```json
+{
+  "success": true,
+  "query": "tech",
+  "users": [{ "username": "tech_guru" }],
+  "posts": []
+}
+```
+
+## Communities API
+
+The backend seeds these communities for the current frontend:
+
+```text
+r/technology
+r/programming
+r/worldnews
+r/science
+r/artificial
+r/personalfinance
+r/MachineLearning
+r/datascience
+```
+
+The four explicitly requested community cards are `artificial`,
+`personalfinance`, `MachineLearning`, and `datascience`.
+
+List communities:
+
+```http
+GET /api/communities
+```
+
+```json
+{
+  "success": true,
+  "communities": [
+    {
+      "name": "artificial",
+      "color": "#8B5CF6",
+      "avatarUrl": null,
+      "memberCount": 0,
+      "joined": false
+    }
+  ]
+}
+```
+
+Join or leave, authenticated:
+
+```http
+POST   /api/communities/artificial/join
+DELETE /api/communities/artificial/join
+```
+
+Only a joined user is authorized to load or send messages in that community's
+chat.
+
+## Follows And Chat API
+
+### Follow Gating
+
+Direct chat is enabled only once both users follow one another:
+
+```http
+POST   /api/profiles/:username/follow
+DELETE /api/profiles/:username/follow
+```
+
+Success response:
+
+```json
+{
+  "success": true,
+  "viewer": {
+    "username": "other_user",
+    "isFollowing": true
+  }
+}
+```
+
+### Message History
+
+Both message-history endpoints require authentication and return stored
+messages in display order:
+
+```http
+GET /api/chats/communities/:name/messages?limit=20&cursor=<cursor>
+GET /api/chats/users/:username/messages?limit=20&cursor=<cursor>
+```
+
+Community history returns `403` unless the requester has joined the community.
+Direct history returns `403` unless the two users mutually follow.
+
+```json
+{
+  "success": true,
+  "community": "artificial",
+  "messages": [
+    {
+      "id": 1,
+      "sender": "sample_user",
+      "body": "Hello everyone.",
+      "createdAt": "2026-05-25T03:15:00.000Z"
+    }
+  ],
+  "nextCursor": null
+}
+```
+
+For direct messages, the response replaces `community` with
+`"with": "other_user"`.
+
+### Socket.IO Realtime Messages
+
+Connect Socket.IO to the same backend host with the session cookie included:
+
+```js
+import { io } from 'socket.io-client';
+
+const socket = io(API_ORIGIN, { withCredentials: true });
+```
+
+The socket handshake requires a valid login cookie.
+
+Community events:
+
+| Direction | Event | Payload |
+| --- | --- | --- |
+| client -> server | `community:join` | `{ "community": "artificial" }` |
+| client -> server | `community:leave` | `{ "community": "artificial" }` |
+| client -> server | `community:message:send` | `{ "community": "artificial", "body": "Hello" }` |
+| server -> client | `community:message` | `{ "community": "artificial", "message": { ... } }` |
+
+Direct message events:
+
+| Direction | Event | Payload |
+| --- | --- | --- |
+| client -> server | `direct:join` | `{ "username": "other_user" }` |
+| client -> server | `direct:leave` | `{ "username": "other_user" }` |
+| client -> server | `direct:message:send` | `{ "username": "other_user", "body": "Hello" }` |
+| server -> client | `direct:message` | `{ "with": "other_user", "message": { ... } }` |
+
+Send/join events accept Socket.IO acknowledgements. A successful
+acknowledgement begins with `{ "success": true }`; authorization or validation
+failures return `{ "success": false, "error": "..." }`.
+
+The frontend must wait for a successful `community:join` or `direct:join`
+acknowledgement before enabling message sending. The backend rejects sends
+from sockets that have not joined the corresponding room. When switching away
+from an open conversation, emit the corresponding `:leave` event so that old
+room broadcasts are no longer shown.
+
+Socket.IO rooms do not survive a disconnect. After every reconnect, the
+frontend must emit `community:join` or `direct:join` again for the currently
+visible conversation before enabling send.
+
+Community membership is rechecked at send and broadcast time. If a user is no
+longer a member after previously joining a socket room, that socket no longer
+receives community broadcasts. Direct-message send authorization continues to
+require mutual follows.
+
+## Notifications API
+
+When an authenticated user creates a post, the backend creates a notification
+for that user. Fetch the notification page data with:
+
+```http
+GET /api/notifications?limit=20&cursor=<cursor>
+```
+
+```json
+{
+  "success": true,
+  "notifications": [
+    {
+      "id": 1,
+      "type": "post_created",
+      "message": "Your post has been published.",
+      "postId": 1,
+      "actor": "sample_user",
+      "read": false,
+      "createdAt": "2026-05-25T03:15:00.000Z"
+    }
+  ],
+  "nextCursor": null
+}
+```
+
+## Current User Details API
+
+Public posted content is available from:
+
+```http
+GET /api/profiles/:username/activity?type=posts
+```
+
+The signed-in user can change their username, subject to the same registration
+format and case-insensitive uniqueness rules:
+
+```http
+PATCH /api/me/username
+Content-Type: application/json
+
+{ "username": "updated_name" }
+```
+
+Success:
+
+```json
+{ "success": true, "user": { "username": "updated_name" } }
+```
+
+Conflict, `409`:
+
+```json
+{ "success": false, "error": "That username is already registered." }
+```
+
+## Database Model
+
+| Table | Purpose |
+| --- | --- |
+| `users`, `auth_sessions` | Existing authentication identity and hashed cookie sessions. |
+| `user_profiles` | Optional public display fields. |
+| `communities` | Public community metadata and seeded community names. |
+| `community_memberships` | Join records; authorization source for community chat. |
+| `posts` | Public post title, description, image URL, community, author, counts, visibility, and time. |
+| `post_votes`, `saved_posts` | Per-viewer home/profile state. |
+| `user_follows` | Follow records; reciprocal rows authorize direct chat. |
+| `community_messages` | Member-only persisted community messages. |
+| `direct_messages` | Persisted messages between mutually-following users. |
+| `notifications` | Notification page items, including author post-created events. |
+
+## General Error Responses
+
+Invalid JSON request body, `400 Bad Request`:
+
+```json
+{ "success": false, "error": "Request body must be valid JSON." }
+```
+
+Unknown endpoint, `404 Not Found`:
+
+```json
+{ "success": false, "error": "Endpoint not found." }
+```
+
+Unexpected backend/database failure, `500 Internal Server Error`:
+
+```json
+{ "success": false, "error": "Authentication service failed." }
+```
+
+Frontend behavior should use `error` for user-visible failures and should not
+assume unsuccessful requests throw automatically: `fetch()` resolves normally
+for HTTP `400`, `401`, `409`, and `500`.
+
+## Suggested Frontend Auth Flow
+
+1. On app startup, call `GET /api/auth/session` with credentials included.
+2. If it returns `success: true`, store the returned `user` in reactive UI
+   state.
+3. If it returns `401`, clear local UI auth state and show the guest state.
+4. After registration or login success, immediately store the returned `user`
+   in UI state; the session cookie has already been set by the browser.
+5. On logout success, clear all locally stored/current user state.
+6. Never store passwords or try to read the session cookie from JavaScript.
+7. Use the returned `createdAt` timestamps for relative-time formatting.
+8. Join community chat rooms or direct chat rooms through Socket.IO only after
+   the matching REST authorization state exists.
+
+## Backend Development Setup
+
+Requires Node.js 20 or later.
+
+```bash
+npm install
+cp .env.example .env
+npm run db:migrate
+npm run dev
+```
+
+Set `DATABASE_URL` only in backend environment variables or the ignored local
+`.env` file. Never expose it through a `VITE_*` variable or commit it.
+
+Available commands:
+
+```bash
+npm test            # Run endpoint contract tests
+npm run db:migrate  # Create PostgreSQL users/session tables
+npm start           # Start the HTTP server
+```
+
+## Railway Deployment Configuration
+
+Relevant backend environment variables:
+
+| Variable | Example / Purpose |
+| --- | --- |
+| `NODE_ENV` | `production` |
+| `DATABASE_URL` | Private PostgreSQL connection string. Never expose to frontend code. |
+| `FRONTEND_ORIGIN` | `https://your-frontend.example` |
+| `COOKIE_SECURE` | `true` for HTTPS deployment. |
+| `COOKIE_SAME_SITE` | `none` when frontend and API are on separate sites. |
+| `SESSION_COOKIE_NAME` | Optional; default `reddit_session`. |
+| `SESSION_TTL_SECONDS` | Optional; default `2592000` (30 days). |
+| `PROFILE_READ_RATE_LIMIT` | Optional; default `120` public/profile reads per window. |
+| `PROFILE_READ_RATE_WINDOW_SECONDS` | Optional; default `60`. |
+| `PORT` | Supplied by Railway. |
+
+Run `npm run db:migrate` against the Railway PostgreSQL database before the
+frontend begins using registration or login.

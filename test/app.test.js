@@ -4,6 +4,7 @@ import request from 'supertest';
 import { createApp } from '../src/app.js';
 import { createConfig } from '../src/config.js';
 import { HttpError } from '../src/errors.js';
+import { ProfileService } from '../src/profile/profile.service.js';
 
 const user = {
   id: 1,
@@ -12,8 +13,23 @@ const user = {
   joinDate: '2026-05-25T00:00:00.000Z',
 };
 
-function setup(overrides = {}) {
+const publicProfile = {
+  username: 'sample_user',
+  displayName: null,
+  bio: null,
+  avatarUrl: null,
+  bannerColor: null,
+  postKarma: 0,
+  commentKarma: 0,
+  followers: 0,
+  cakeDay: '2026-05-25T00:00:00.000Z',
+  communities: [],
+};
+
+function setup(authOverrides = {}, profileOverrides = {}, serviceOverrides = {}) {
   const calls = [];
+  const profileCalls = [];
+  const domainCalls = [];
   const authService = {
     async register(details) {
       calls.push(['register', details]);
@@ -31,7 +47,80 @@ function setup(overrides = {}) {
     async logout(token) {
       calls.push(['logout', token]);
     },
-    ...overrides,
+    ...authOverrides,
+  };
+  const profileService = {
+    async findPublicProfile(username) {
+      profileCalls.push(['profile', username]);
+      if (username === 'missing') throw new HttpError(404, 'Profile not found.');
+      return { userId: 1, profile: publicProfile };
+    },
+    async activity(username, options) {
+      profileCalls.push(['activity', username, options]);
+      if (username === 'missing') throw new HttpError(404, 'Profile not found.');
+      return { items: [], nextCursor: null };
+    },
+    async saved(userId, options) {
+      profileCalls.push(['saved', userId, options]);
+      return { items: [], nextCursor: null };
+    },
+    async isFollowing(viewerId, targetId) {
+      profileCalls.push(['following', viewerId, targetId]);
+      return false;
+    },
+    ...profileOverrides,
+  };
+  const postService = {
+    async list(options) {
+      domainCalls.push(['posts', options]);
+      return { posts: [], nextCursor: null };
+    },
+    async create(userId, details) {
+      domainCalls.push(['create-post', userId, details]);
+      return { id: 9, title: details.title, community: details.community };
+    },
+    async search(query, limit) {
+      domainCalls.push(['search', query, limit]);
+      return { users: [], posts: [] };
+    },
+    ...serviceOverrides.postService,
+  };
+  const communityService = {
+    async list(userId) {
+      domainCalls.push(['communities', userId]);
+      return [];
+    },
+    async join(name, userId) {
+      domainCalls.push(['join', name, userId]);
+      return { name, joined: true };
+    },
+    ...serviceOverrides.communityService,
+  };
+  const socialService = {
+    async follow(userId, username) {
+      domainCalls.push(['follow', userId, username]);
+      return { username, isFollowing: true };
+    },
+    async notifications(userId, limit, offset) {
+      domainCalls.push(['notifications', userId, limit, offset]);
+      return { notifications: [], nextCursor: null };
+    },
+    async updateUsername(userId, username) {
+      domainCalls.push(['username', userId, username]);
+      return { username };
+    },
+    ...serviceOverrides.socialService,
+  };
+  const chatService = {
+    async communityHistory(userId, name, limit, offset) {
+      domainCalls.push(['community-messages', userId, name, limit, offset]);
+      return { community: name, messages: [], nextCursor: null };
+    },
+    async directHistory(userId, username, limit, offset) {
+      domainCalls.push(['direct-messages', userId, username, limit, offset]);
+      return { with: username, messages: [], nextCursor: null };
+    },
+    ...serviceOverrides.chatService,
   };
   const config = createConfig({
     NODE_ENV: 'test',
@@ -44,6 +133,11 @@ function setup(overrides = {}) {
   const app = createApp({
     config,
     authService,
+    profileService,
+    postService,
+    communityService,
+    socialService,
+    chatService,
     logger: { error() {} },
     healthService: {
       async check() {
@@ -52,7 +146,7 @@ function setup(overrides = {}) {
     },
   });
 
-  return { app, calls };
+  return { app, calls, profileCalls, domainCalls };
 }
 
 describe('authentication API', () => {
@@ -174,5 +268,279 @@ describe('application middleware', () => {
     assert.equal(allowed.headers['access-control-allow-origin'], 'http://localhost:5173');
     assert.equal(allowed.headers['access-control-allow-credentials'], 'true');
     assert.equal(disallowed.headers['access-control-allow-origin'], undefined);
+  });
+});
+
+describe('public profile API', () => {
+  it('returns a public-only profile with an anonymous viewer state', async () => {
+    const { app } = setup();
+    const response = await request(app).get('/api/profiles/sample_user');
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, {
+      success: true,
+      profile: publicProfile,
+      viewer: {
+        isAuthenticated: false,
+        isSelf: false,
+        isFollowing: false,
+        canMessage: false,
+      },
+    });
+    assert.equal(JSON.stringify(response.body).includes('email'), false);
+  });
+
+  it('reports signed-in self viewer context without serializing auth email', async () => {
+    const { app } = setup();
+    const response = await request(app)
+      .get('/api/profiles/sample_user')
+      .set('Cookie', 'reddit_session=login-token');
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body.viewer, {
+      isAuthenticated: true,
+      isSelf: true,
+      isFollowing: false,
+      canMessage: false,
+    });
+    assert.equal(JSON.stringify(response.body).includes('sample@example.com'), false);
+  });
+
+  it('reports messaging eligibility for an authenticated non-owner viewer', async () => {
+    const { app } = setup({
+      async session() {
+        return { user: { ...user, id: 2, username: 'other_viewer' } };
+      },
+    }, {
+      async isFollowing() {
+        return false;
+      },
+    });
+    const response = await request(app)
+      .get('/api/profiles/sample_user')
+      .set('Cookie', 'reddit_session=other-viewer-token');
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body.viewer, {
+      isAuthenticated: true,
+      isSelf: false,
+      isFollowing: false,
+      canMessage: true,
+    });
+  });
+
+  it('does not fail a public profile request for an invalid session cookie', async () => {
+    const { app } = setup({
+      async session() {
+        throw new HttpError(401, 'Session expired or invalid.');
+      },
+    });
+    const response = await request(app)
+      .get('/api/profiles/sample_user')
+      .set('Cookie', 'reddit_session=expired-token');
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.viewer.isAuthenticated, false);
+    assert.equal(response.body.viewer.isSelf, false);
+  });
+
+  it('returns JSON 404 for an unknown public profile', async () => {
+    const { app } = setup();
+    const response = await request(app).get('/api/profiles/missing');
+
+    assert.equal(response.status, 404);
+    assert.deepEqual(response.body, { success: false, error: 'Profile not found.' });
+  });
+
+  it('returns empty public activity and passes validated paging options', async () => {
+    const { app, profileCalls } = setup();
+    const response = await request(app)
+      .get('/api/profiles/sample_user/activity?type=comments&limit=12&cursor=opaque-next');
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { success: true, items: [], nextCursor: null });
+    assert.deepEqual(profileCalls[0], ['activity', 'sample_user', {
+      type: 'comments',
+      limit: 12,
+      cursor: 'opaque-next',
+    }]);
+  });
+
+  it('rejects saved activity on the public profile endpoint', async () => {
+    const { app, profileCalls } = setup();
+    const response = await request(app).get('/api/profiles/sample_user/activity?type=saved');
+
+    assert.equal(response.status, 400);
+    assert.deepEqual(response.body, { success: false, error: 'Saved activity is private.' });
+    assert.equal(profileCalls.length, 0);
+  });
+});
+
+describe('saved items API', () => {
+  it('requires a valid authenticated session', async () => {
+    const { app } = setup();
+    const response = await request(app).get('/api/me/saved');
+
+    assert.equal(response.status, 401);
+    assert.deepEqual(response.body, {
+      success: false,
+      error: 'You must be logged in to view saved posts.',
+    });
+  });
+
+  it('returns the shared activity shape to an authenticated viewer', async () => {
+    const { app, profileCalls } = setup();
+    const response = await request(app)
+      .get('/api/me/saved?limit=20')
+      .set('Cookie', 'reddit_session=login-token');
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { success: true, items: [], nextCursor: null });
+    assert.deepEqual(profileCalls[0], ['saved', 1, { limit: 20, cursor: null }]);
+  });
+});
+
+describe('profile data serialization', () => {
+  it('looks up canonical users case-insensitively and emits public fields only', async () => {
+    const queries = [];
+    const service = new ProfileService({
+      async query(text, parameters) {
+        queries.push([text, parameters]);
+        if (text.includes('community_memberships')) {
+          return { rows: [] };
+        }
+        return {
+          rows: [{
+            id: '1',
+            username: 'Tech_Guru',
+            email: 'private@example.com',
+            created_at: String(Date.parse('2021-10-19T00:00:00.000Z')),
+            display_name: 'Tech Guru',
+            bio: 'Public bio',
+            avatar_url: 'http://insecure.example/avatar.png',
+            banner_color: 'not-a-color',
+          }],
+        };
+      },
+    });
+
+    const result = await service.findPublicProfile('tech_guru');
+
+    assert.equal(queries[0][0].includes('LOWER(users.username) = LOWER($1)'), true);
+    assert.deepEqual(queries[0][1], ['tech_guru']);
+    assert.deepEqual(result.profile, {
+      username: 'Tech_Guru',
+      displayName: 'Tech Guru',
+      bio: 'Public bio',
+      avatarUrl: null,
+      bannerColor: null,
+      postKarma: 0,
+      commentKarma: 0,
+      followers: 0,
+      cakeDay: '2021-10-19T00:00:00.000Z',
+      communities: [],
+    });
+    assert.equal('email' in result.profile, false);
+  });
+});
+
+describe('home page and post API', () => {
+  it('passes feed sorting and paging to the persisted post service', async () => {
+    const { app, domainCalls } = setup();
+    const response = await request(app).get('/api/posts?sort=hot&limit=20');
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { success: true, posts: [], nextCursor: null });
+    assert.deepEqual(domainCalls[0], ['posts', {
+      viewerId: null,
+      sort: 'hot',
+      limit: 20,
+      offset: 0,
+    }]);
+  });
+
+  it('creates the low-level title, picture, and description post shape for a signed-in user', async () => {
+    const { app, domainCalls } = setup();
+    const response = await request(app)
+      .post('/api/posts')
+      .set('Cookie', 'reddit_session=login-token')
+      .send({
+        community: 'technology',
+        title: 'Quantum computing update',
+        image: 'https://images.example.test/post.jpg',
+        description: 'Description for the frontend post editor.',
+      });
+
+    assert.equal(response.status, 201);
+    assert.equal(response.body.success, true);
+    assert.deepEqual(domainCalls[0], ['create-post', 1, {
+      community: 'technology',
+      title: 'Quantum computing update',
+      image: 'https://images.example.test/post.jpg',
+      text: 'Description for the frontend post editor.',
+    }]);
+  });
+
+  it('searches usernames and post titles', async () => {
+    const { app, domainCalls } = setup();
+    const response = await request(app).get('/api/search?q=tech&limit=10');
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.query, 'tech');
+    assert.deepEqual(domainCalls[0], ['search', 'tech', 10]);
+  });
+});
+
+describe('community, social, notification, and chat API', () => {
+  it('joins a community for an authenticated user', async () => {
+    const { app, domainCalls } = setup();
+    const response = await request(app)
+      .post('/api/communities/artificial/join')
+      .set('Cookie', 'reddit_session=login-token');
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body.community, { name: 'artificial', joined: true });
+    assert.deepEqual(domainCalls[0], ['join', 'artificial', 1]);
+  });
+
+  it('creates a follow needed for mutual direct chat and lists notifications', async () => {
+    const { app, domainCalls } = setup();
+    const follow = await request(app)
+      .post('/api/profiles/other_user/follow')
+      .set('Cookie', 'reddit_session=login-token');
+    const notifications = await request(app)
+      .get('/api/notifications?limit=20')
+      .set('Cookie', 'reddit_session=login-token');
+
+    assert.equal(follow.status, 200);
+    assert.equal(notifications.status, 200);
+    assert.deepEqual(domainCalls[0], ['follow', 1, 'other_user']);
+    assert.deepEqual(domainCalls[1], ['notifications', 1, 20, 0]);
+  });
+
+  it('updates a signed-in username through its dedicated endpoint', async () => {
+    const { app, domainCalls } = setup();
+    const response = await request(app)
+      .patch('/api/me/username')
+      .set('Cookie', 'reddit_session=login-token')
+      .send({ username: 'new_username' });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(domainCalls[0], ['username', 1, 'new_username']);
+  });
+
+  it('exposes authenticated REST history endpoints used before socket subscriptions', async () => {
+    const { app, domainCalls } = setup();
+    const community = await request(app)
+      .get('/api/chats/communities/artificial/messages')
+      .set('Cookie', 'reddit_session=login-token');
+    const direct = await request(app)
+      .get('/api/chats/users/other_user/messages')
+      .set('Cookie', 'reddit_session=login-token');
+
+    assert.equal(community.status, 200);
+    assert.equal(direct.status, 200);
+    assert.deepEqual(domainCalls[0], ['community-messages', 1, 'artificial', 20, 0]);
+    assert.deepEqual(domainCalls[1], ['direct-messages', 1, 'other_user', 20, 0]);
   });
 });

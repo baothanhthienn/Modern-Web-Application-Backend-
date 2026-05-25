@@ -1,11 +1,22 @@
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import express from 'express';
+import { rateLimit } from 'express-rate-limit';
 import helmet from 'helmet';
 import { createAuthRouter } from './auth/auth.routes.js';
 import { AuthService } from './auth/auth.service.js';
+import { ChatService } from './chat/chat.service.js';
+import { createChatRouter } from './chat/chat.routes.js';
+import { createCommunityRouter } from './community/community.routes.js';
+import { CommunityService } from './community/community.service.js';
+import { createPostRouter, createSearchRouter } from './content/post.routes.js';
+import { PostService } from './content/post.service.js';
 import { HttpError } from './errors.js';
 import { HealthService } from './health.service.js';
+import { createMeRouter, createProfileRouter } from './profile/profile.routes.js';
+import { ProfileService } from './profile/profile.service.js';
+import { createSocialRouter } from './social/social.routes.js';
+import { SocialService } from './social/social.service.js';
 
 function corsOrigin(config) {
   return (origin, callback) => {
@@ -16,10 +27,42 @@ function corsOrigin(config) {
   };
 }
 
-export function createApp({ config, db, authService, healthService, logger = console } = {}) {
+export function createApp({
+  config,
+  db,
+  authService,
+  healthService,
+  profileService,
+  postService,
+  communityService,
+  socialService,
+  chatService,
+  logger = console,
+} = {}) {
   const app = express();
   const resolvedAuthService = authService || new AuthService(db, config);
   const resolvedHealthService = healthService || new HealthService(db);
+  const resolvedProfileService = profileService || new ProfileService(db);
+  const resolvedPostService = postService || new PostService(db);
+  const resolvedCommunityService = communityService || new CommunityService(db);
+  const resolvedSocialService = socialService || new SocialService(db);
+  const resolvedChatService = chatService || new ChatService(
+    db,
+    resolvedCommunityService,
+    resolvedSocialService,
+  );
+  const profileReadLimiter = rateLimit({
+    windowMs: config.profileReadRateWindowMs,
+    limit: config.profileReadRateLimit,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler(request, response) {
+      response.status(429).json({
+        success: false,
+        error: 'Too many profile requests. Please try again later.',
+      });
+    },
+  });
 
   if (config.isProduction) {
     app.set('trust proxy', 1);
@@ -39,6 +82,48 @@ export function createApp({ config, db, authService, healthService, logger = con
     }
   });
   app.use('/api/auth', createAuthRouter({ authService: resolvedAuthService, config }));
+  app.use(
+    '/api/posts',
+    profileReadLimiter,
+    createPostRouter({ postService: resolvedPostService, authService: resolvedAuthService, config }),
+  );
+  app.use('/api/search', profileReadLimiter, createSearchRouter({ postService: resolvedPostService }));
+  app.use(
+    '/api/communities',
+    profileReadLimiter,
+    createCommunityRouter({
+      communityService: resolvedCommunityService,
+      authService: resolvedAuthService,
+      config,
+    }),
+  );
+  app.use(
+    '/api/profiles',
+    profileReadLimiter,
+    createProfileRouter({
+      profileService: resolvedProfileService,
+      authService: resolvedAuthService,
+      config,
+    }),
+  );
+  app.use(
+    '/api/me',
+    profileReadLimiter,
+    createMeRouter({
+      profileService: resolvedProfileService,
+      authService: resolvedAuthService,
+      config,
+    }),
+  );
+  app.use(
+    '/api/chats',
+    profileReadLimiter,
+    createChatRouter({ chatService: resolvedChatService, authService: resolvedAuthService, config }),
+  );
+  app.use(
+    '/api',
+    createSocialRouter({ socialService: resolvedSocialService, authService: resolvedAuthService, config }),
+  );
 
   app.use((request, response) => {
     response.status(404).json({ success: false, error: 'Endpoint not found.' });
