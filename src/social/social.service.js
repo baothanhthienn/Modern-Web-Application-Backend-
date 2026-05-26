@@ -8,7 +8,7 @@ function serializeNotification(row) {
     message: row.message,
     postId: row.post_id === null ? null : Number(row.post_id),
     actor: row.actor,
-    targetUsername: row.type === 'mutual_follow' ? row.target_username : null,
+    targetUsername: ['new_follower', 'mutual_follow'].includes(row.type) ? row.target_username : null,
     read: Boolean(row.read_at),
     createdAt: new Date(row.created_at).toISOString(),
   };
@@ -17,6 +17,7 @@ function serializeNotification(row) {
 export class SocialService {
   constructor(db) {
     this.db = db;
+    this.onNotification = null;
     this.onMutualFollow = null;
   }
 
@@ -42,6 +43,12 @@ export class SocialService {
       'SELECT 1 FROM user_follows WHERE follower_id = $1 AND followed_id = $2',
       [target.id, followerId],
     );
+    if (follow.rows[0]) {
+      const notification = await this.createNewFollowerNotification(Number(followerId), target);
+      if (this.onNotification) {
+        await this.onNotification(target.id, notification);
+      }
+    }
     if (follow.rows[0] && mutual.rows[0]) {
       const notifications = await this.createMutualFollowNotifications(Number(followerId), target.id);
       if (this.onMutualFollow) {
@@ -59,12 +66,34 @@ export class SocialService {
     );
     await this.db.query(
       `DELETE FROM notifications
-       WHERE type = 'mutual_follow'
-         AND ((user_id = $1 AND related_user_id = $2)
-           OR (user_id = $2 AND related_user_id = $1))`,
+       WHERE (type = 'mutual_follow'
+           AND ((user_id = $1 AND related_user_id = $2)
+             OR (user_id = $2 AND related_user_id = $1)))
+          OR (type = 'new_follower'
+           AND user_id = $2 AND related_user_id = $1)`,
       [followerId, target.id],
     );
     return { username: target.username, isFollowing: false };
+  }
+
+  async createNewFollowerNotification(followerId, target) {
+    const actor = await this.db.query(
+      'SELECT username FROM users WHERE id = $1',
+      [followerId],
+    );
+    const actorUsername = actor.rows[0].username;
+    const result = await this.db.query(
+      `INSERT INTO notifications (user_id, type, actor_id, related_user_id, message)
+       VALUES ($1, 'new_follower', $2, $2, $3)
+       RETURNING id, user_id, type, actor_id, related_user_id, message,
+                 post_id, read_at, created_at`,
+      [target.id, followerId, `u/${actorUsername} followed you.`],
+    );
+    return serializeNotification({
+      ...result.rows[0],
+      actor: actorUsername,
+      target_username: actorUsername,
+    });
   }
 
   async createMutualFollowNotifications(firstUserId, secondUserId) {

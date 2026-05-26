@@ -195,6 +195,24 @@ function delay(milliseconds = 30) {
 }
 
 describe('Socket.IO chat contract', () => {
+  it('emits a follower notification without requiring reciprocal follow', async () => {
+    const { origin, chatService } = await serverFixture();
+    const bob = await socketClient(origin, 'token-bob');
+    const bobNotification = once(bob, 'notification:new');
+
+    await chatService.socialService.onNotification(2, {
+      type: 'new_follower',
+      actor: 'alice',
+      targetUsername: 'alice',
+    });
+
+    assert.deepEqual((await bobNotification).notification, {
+      type: 'new_follower',
+      actor: 'alice',
+      targetUsername: 'alice',
+    });
+  });
+
   it('delivers one persisted community message to two joined members and REST history', async () => {
     const { origin } = await serverFixture();
     const alice = await socketClient(origin, 'token-alice');

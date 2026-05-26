@@ -667,31 +667,62 @@ describe('chat reaction validation', () => {
   });
 });
 
-describe('mutual follow notifications', () => {
-  it('does not create notifications until a follow becomes mutual', async () => {
-    const statements = [];
+describe('follow notifications', () => {
+  it('notifies the followed user before the follow becomes mutual', async () => {
+    const notifications = [];
     const service = new SocialService({
       async query(sql) {
-        statements.push(sql);
-        if (sql.includes('SELECT id, username FROM users')) {
+        if (sql.includes('SELECT id, username FROM users WHERE LOWER')) {
           return { rows: [{ id: '2', username: 'bob' }] };
         }
         if (sql.includes('INSERT INTO user_follows')) {
           return { rows: [{ follower_id: '1' }] };
         }
         if (sql.includes('SELECT 1 FROM user_follows')) return { rows: [] };
+        if (sql.includes('SELECT username FROM users WHERE id')) {
+          return { rows: [{ username: 'alice' }] };
+        }
+        if (sql.includes("'new_follower'")) {
+          return {
+            rows: [{
+              id: '40',
+              user_id: '2',
+              type: 'new_follower',
+              actor_id: '1',
+              related_user_id: '1',
+              message: 'u/alice followed you.',
+              post_id: null,
+              read_at: null,
+              created_at: new Date('2026-05-26T10:00:00.000Z'),
+            }],
+          };
+        }
         throw new Error('Unexpected query');
       },
     });
+    service.onNotification = async (userId, notification) => notifications.push({ userId, notification });
 
     await service.follow(1, 'bob');
 
-    assert.equal(statements.some((sql) => sql.includes('INSERT INTO notifications')), false);
+    assert.deepEqual(notifications, [{
+      userId: 2,
+      notification: {
+        id: 40,
+        type: 'new_follower',
+        message: 'u/alice followed you.',
+        postId: null,
+        actor: 'alice',
+        targetUsername: 'alice',
+        read: false,
+        createdAt: '2026-05-26T10:00:00.000Z',
+      },
+    }]);
   });
 
-  it('creates two frontend-routable notifications once and serializes target usernames', async () => {
+  it('adds mutual-chat notifications once when a reciprocal follow is established', async () => {
     let insertedFollow = false;
-    let notificationWrites = 0;
+    let newFollowerWrites = 0;
+    let mutualWrites = 0;
     const callbackCalls = [];
     const createdAt = new Date('2026-05-26T10:20:30.000Z');
     const service = new SocialService({
@@ -705,11 +736,30 @@ describe('mutual follow notifications', () => {
           return { rows: [{ follower_id: '1' }] };
         }
         if (sql.includes('SELECT 1 FROM user_follows')) return { rows: [{ '?column?': 1 }] };
+        if (sql.includes('SELECT username FROM users WHERE id')) {
+          return { rows: [{ username: 'alice' }] };
+        }
+        if (sql.includes("'new_follower'")) {
+          newFollowerWrites += 1;
+          return {
+            rows: [{
+              id: '41',
+              user_id: '2',
+              type: 'new_follower',
+              actor_id: '1',
+              related_user_id: '1',
+              message: 'u/alice followed you.',
+              post_id: null,
+              read_at: null,
+              created_at: createdAt,
+            }],
+          };
+        }
         if (sql.includes('SELECT id, username FROM users WHERE id IN')) {
           return { rows: [{ id: '1', username: 'alice' }, { id: '2', username: 'bob' }] };
         }
-        if (sql.includes('INSERT INTO notifications')) {
-          notificationWrites += 1;
+        if (sql.includes("'mutual_follow'")) {
+          mutualWrites += 1;
           return {
             rows: [
               {
@@ -745,7 +795,8 @@ describe('mutual follow notifications', () => {
     await service.follow(1, 'bob');
     await service.follow(1, 'bob');
 
-    assert.equal(notificationWrites, 1);
+    assert.equal(newFollowerWrites, 1);
+    assert.equal(mutualWrites, 1);
     assert.equal(callbackCalls.length, 1);
     assert.deepEqual(callbackCalls[0][2][0].notification, {
       id: 42,
@@ -759,11 +810,21 @@ describe('mutual follow notifications', () => {
     });
   });
 
-  it('returns targetUsername only for mutual-follow notification items', async () => {
+  it('returns targetUsername for user-related notification items', async () => {
     const service = new SocialService({
       async query() {
         return {
           rows: [
+            {
+              id: '41',
+              type: 'new_follower',
+              message: 'u/bob followed you.',
+              post_id: null,
+              read_at: null,
+              created_at: new Date('2026-05-26T10:19:30.000Z'),
+              actor: 'bob',
+              target_username: 'bob',
+            },
             {
               id: '42',
               type: 'mutual_follow',
@@ -792,6 +853,7 @@ describe('mutual follow notifications', () => {
     const result = await service.notifications(1, 20, 0);
 
     assert.equal(result.notifications[0].targetUsername, 'bob');
-    assert.equal(result.notifications[1].targetUsername, null);
+    assert.equal(result.notifications[1].targetUsername, 'bob');
+    assert.equal(result.notifications[2].targetUsername, null);
   });
 });

@@ -326,6 +326,10 @@ export function attachSocketServer(httpServer, { config, authService, chatServic
   });
 
   if (chatService.socialService) {
+    chatService.socialService.onNotification = async (userId, notification) => {
+      io.to(userRoom(userId)).emit('notification:new', { notification });
+    };
+
     chatService.socialService.onMutualFollow = async (firstUserId, secondUserId, notifications = []) => {
       if (typeof chatService.conversation === 'function') {
         const [first, second] = await Promise.all([
