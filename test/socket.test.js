@@ -354,11 +354,18 @@ describe('Socket.IO chat contract', () => {
     const bob = await socketClient(origin, 'token-bob');
     const aliceConversation = once(alice, 'direct:conversation');
     const bobConversation = once(bob, 'direct:conversation');
+    const aliceNotification = once(alice, 'notification:new');
+    const bobNotification = once(bob, 'notification:new');
 
-    await chatService.socialService.onMutualFollow(1, 2);
+    await chatService.socialService.onMutualFollow(1, 2, [
+      { userId: 1, notification: { type: 'mutual_follow', targetUsername: 'bob' } },
+      { userId: 2, notification: { type: 'mutual_follow', targetUsername: 'alice' } },
+    ]);
 
     assert.equal((await aliceConversation).conversation.username, 'bob');
     assert.equal((await bobConversation).conversation.username, 'alice');
+    assert.equal((await aliceNotification).notification.targetUsername, 'bob');
+    assert.equal((await bobNotification).notification.targetUsername, 'alice');
   });
 
   it('requires room joins, blocks revoked community recipients, and supports leaving', async () => {

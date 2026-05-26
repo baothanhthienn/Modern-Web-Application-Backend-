@@ -326,14 +326,20 @@ export function attachSocketServer(httpServer, { config, authService, chatServic
   });
 
   if (chatService.socialService) {
-    chatService.socialService.onMutualFollow = async (firstUserId, secondUserId) => {
-      if (typeof chatService.conversation !== 'function') return;
-      const [first, second] = await Promise.all([
-        chatService.conversation(firstUserId, secondUserId),
-        chatService.conversation(secondUserId, firstUserId),
-      ]);
-      io.to(userRoom(firstUserId)).emit('direct:conversation', { conversation: first });
-      io.to(userRoom(secondUserId)).emit('direct:conversation', { conversation: second });
+    chatService.socialService.onMutualFollow = async (firstUserId, secondUserId, notifications = []) => {
+      if (typeof chatService.conversation === 'function') {
+        const [first, second] = await Promise.all([
+          chatService.conversation(firstUserId, secondUserId),
+          chatService.conversation(secondUserId, firstUserId),
+        ]);
+        io.to(userRoom(firstUserId)).emit('direct:conversation', { conversation: first });
+        io.to(userRoom(secondUserId)).emit('direct:conversation', { conversation: second });
+      }
+      for (const item of notifications) {
+        io.to(userRoom(item.userId)).emit('notification:new', {
+          notification: item.notification,
+        });
+      }
     };
   }
 
