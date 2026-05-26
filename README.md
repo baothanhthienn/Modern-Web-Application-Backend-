@@ -138,6 +138,8 @@ GET  /api/me/saved?limit=20&cursor=<cursor>
 GET  /api/posts?sort=best&limit=20&cursor=<cursor>
 POST /api/posts
 GET  /api/posts/:postId
+PATCH /api/posts/:postId
+DELETE /api/posts/:postId
 PUT  /api/posts/:postId/vote
 PUT  /api/posts/:postId/saved
 DELETE /api/posts/:postId/saved
@@ -724,8 +726,91 @@ Success, `201 Created`:
 ```
 
 Creating a post also inserts a `post_created` notification for the author.
-Only HTTPS image URLs are accepted. Link posts, post editing, comments, and
-reactions are reserved for later endpoints.
+Only HTTPS image URLs are accepted. Link posts, comments, and reactions are
+reserved for later endpoints.
+
+### Edit Or Delete Own Post
+
+Only the authenticated author of a public post can edit or delete it. Requests
+by another user return `404` so the API does not disclose private ownership
+details. The frontend should show edit and delete controls only when the
+signed-in session username matches the post `author`; the backend still
+performs the authoritative ownership check.
+
+Update one or more editable fields:
+
+```http
+PATCH /api/posts/:postId
+Content-Type: application/json
+```
+
+```json
+{
+  "title": "Updated title",
+  "description": "Updated description.",
+  "image": "https://images.example/updated-post.jpg",
+  "community": "technology"
+}
+```
+
+The editable fields are `title`, `description`/`text`, `image`/`imageUrl`,
+and `community`. Use `null` for `description` or `image` to remove it. Fields
+not supplied are retained. Success, `200 OK`, returns the same complete post
+object shape returned by the feed and post-detail endpoint:
+
+```json
+{
+  "success": true,
+  "post": {
+    "id": 1,
+    "community": "technology",
+    "communityColor": "#A855F7",
+    "author": "tech_guru",
+    "createdAt": "2026-05-25T03:15:00.000Z",
+    "flair": null,
+    "flairColor": null,
+    "title": "Updated title",
+    "image": "https://images.example/updated-post.jpg",
+    "text": "Updated description.",
+    "link": null,
+    "linkDomain": null,
+    "votes": 0,
+    "comments": 0,
+    "reactions": 0,
+    "userVote": 0,
+    "saved": false
+  }
+}
+```
+
+Delete a post:
+
+```http
+DELETE /api/posts/:postId
+```
+
+Success, `200 OK`:
+
+```json
+{ "success": true }
+```
+
+Deletion is soft deletion: the post is marked deleted and no longer appears
+in public feed, post detail, search, profile activity, or saved-item results.
+
+Mutation errors:
+
+```http
+401 Unauthorized
+{ "success": false, "error": "Session expired or invalid." }
+
+404 Not Found
+{ "success": false, "error": "Post not found." }
+```
+
+`404` is returned when the post is absent, already deleted, or belongs to
+another user. Validation errors such as a missing update field or a non-HTTPS
+image URL return `400` with a user-facing `error` message.
 
 ### Post Viewer Actions
 

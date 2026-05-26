@@ -4,6 +4,7 @@ import request from 'supertest';
 import { createApp } from '../src/app.js';
 import { ChatService } from '../src/chat/chat.service.js';
 import { createConfig } from '../src/config.js';
+import { PostService } from '../src/content/post.service.js';
 import { HttpError } from '../src/errors.js';
 import { ProfileService } from '../src/profile/profile.service.js';
 import { SocialService } from '../src/social/social.service.js';
@@ -101,6 +102,13 @@ function setup(authOverrides = {}, profileOverrides = {}, serviceOverrides = {})
     async create(userId, details) {
       domainCalls.push(['create-post', userId, details]);
       return { id: 9, title: details.title, community: details.community };
+    },
+    async update(userId, postId, details) {
+      domainCalls.push(['update-post', userId, postId, details]);
+      return { id: Number(postId), ...details };
+    },
+    async delete(userId, postId) {
+      domainCalls.push(['delete-post', userId, postId]);
     },
     async search(query, limit) {
       domainCalls.push(['search', query, limit]);
@@ -524,6 +532,36 @@ describe('home page and post API', () => {
     }]);
   });
 
+  it('updates a post through an authenticated author-only endpoint', async () => {
+    const { app, domainCalls } = setup();
+    const response = await request(app)
+      .patch('/api/posts/9')
+      .set('Cookie', 'reddit_session=login-token')
+      .send({
+        title: 'Updated quantum computing title',
+        description: 'Updated description.',
+        image: null,
+      });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(domainCalls[0], ['update-post', 1, '9', {
+      title: 'Updated quantum computing title',
+      text: 'Updated description.',
+      image: null,
+    }]);
+  });
+
+  it('deletes a post through an authenticated author-only endpoint', async () => {
+    const { app, domainCalls } = setup();
+    const response = await request(app)
+      .delete('/api/posts/9')
+      .set('Cookie', 'reddit_session=login-token');
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { success: true });
+    assert.deepEqual(domainCalls[0], ['delete-post', 1, '9']);
+  });
+
   it('searches usernames and post titles', async () => {
     const { app, domainCalls } = setup();
     const response = await request(app).get('/api/search?q=tech&limit=10');
@@ -531,6 +569,50 @@ describe('home page and post API', () => {
     assert.equal(response.status, 200);
     assert.equal(response.body.query, 'tech');
     assert.deepEqual(domainCalls[0], ['search', 'tech', 10]);
+  });
+});
+
+describe('post ownership enforcement', () => {
+  it('does not update a public post unless it belongs to the authenticated user', async () => {
+    let updateSql = '';
+    let updateParameters = [];
+    const service = new PostService({
+      async transaction(work) {
+        return work({
+          async query(sql, parameters) {
+            updateSql = sql;
+            updateParameters = parameters;
+            return { rows: [] };
+          },
+        });
+      },
+    });
+
+    await assert.rejects(
+      service.update(1, 9, { title: 'Edited title' }),
+      (error) => error instanceof HttpError && error.status === 404,
+    );
+    assert.match(updateSql, /author_id = \$2/);
+    assert.deepEqual(updateParameters.slice(0, 2), [9, 1]);
+  });
+
+  it('does not delete a public post unless it belongs to the authenticated user', async () => {
+    let deleteSql = '';
+    let deleteParameters = [];
+    const service = new PostService({
+      async query(sql, parameters) {
+        deleteSql = sql;
+        deleteParameters = parameters;
+        return { rows: [] };
+      },
+    });
+
+    await assert.rejects(
+      service.delete(1, 9),
+      (error) => error instanceof HttpError && error.status === 404,
+    );
+    assert.match(deleteSql, /author_id = \$2/);
+    assert.deepEqual(deleteParameters, [9, 1]);
   });
 });
 

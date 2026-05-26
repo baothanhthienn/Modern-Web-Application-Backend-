@@ -99,6 +99,52 @@ export class PostService {
     });
   }
 
+  async update(authorId, postId, input) {
+    return this.db.transaction(async (client) => {
+      let communityId = null;
+      if (input.community !== undefined) {
+        const communityResult = await client.query(
+          'SELECT id FROM communities WHERE LOWER(name) = LOWER($1) LIMIT 1',
+          [input.community],
+        );
+        if (!communityResult.rows[0]) throw new HttpError(404, 'Community not found.');
+        communityId = communityResult.rows[0].id;
+      }
+
+      const updated = await client.query(
+        `UPDATE posts
+         SET community_id = COALESCE($3, community_id),
+             title = COALESCE($4, title),
+             body = CASE WHEN $5 THEN $6 ELSE body END,
+             image_url = CASE WHEN $7 THEN $8 ELSE image_url END
+         WHERE id = $1 AND author_id = $2 AND visibility = 'public'
+         RETURNING id`,
+        [
+          postId,
+          authorId,
+          communityId,
+          input.title ?? null,
+          input.text !== undefined,
+          input.text ?? null,
+          input.image !== undefined,
+          input.image ?? null,
+        ],
+      );
+      if (!updated.rows[0]) throw new HttpError(404, 'Post not found.');
+      return this.getWithQueryable(client, postId, authorId);
+    });
+  }
+
+  async delete(authorId, postId) {
+    const result = await this.db.query(
+      `UPDATE posts SET visibility = 'deleted'
+       WHERE id = $1 AND author_id = $2 AND visibility = 'public'
+       RETURNING id`,
+      [postId, authorId],
+    );
+    if (!result.rows[0]) throw new HttpError(404, 'Post not found.');
+  }
+
   async getWithQueryable(queryable, postId, viewerId) {
     const result = await queryable.query(
       `${POST_SELECT}
