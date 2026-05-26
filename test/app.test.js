@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import request from 'supertest';
 import { createApp } from '../src/app.js';
+import { ChatService } from '../src/chat/chat.service.js';
 import { createConfig } from '../src/config.js';
 import { HttpError } from '../src/errors.js';
 import { ProfileService } from '../src/profile/profile.service.js';
@@ -133,6 +134,14 @@ function setup(authOverrides = {}, profileOverrides = {}, serviceOverrides = {})
     ...serviceOverrides.socialService,
   };
   const chatService = {
+    async conversations(userId, limit, offset) {
+      domainCalls.push(['conversations', userId, limit, offset]);
+      return { conversations: [], nextCursor: null };
+    },
+    async markDirectRead(userId, username) {
+      domainCalls.push(['direct-read', userId, username]);
+      return { with: username, messageIds: [12], readAt: '2026-05-26T00:00:00.000Z' };
+    },
     async communityHistory(userId, name, limit, offset) {
       domainCalls.push(['community-messages', userId, name, limit, offset]);
       return { community: name, messages: [], nextCursor: null };
@@ -140,6 +149,18 @@ function setup(authOverrides = {}, profileOverrides = {}, serviceOverrides = {})
     async directHistory(userId, username, limit, offset) {
       domainCalls.push(['direct-messages', userId, username, limit, offset]);
       return { with: username, messages: [], nextCursor: null };
+    },
+    async markCommunityRead(userId, name) {
+      domainCalls.push(['community-read', userId, name]);
+      return { community: name, messageIds: [7], readAt: '2026-05-26T00:00:00.000Z' };
+    },
+    async setDirectReaction(userId, username, messageId, reaction) {
+      domainCalls.push(['direct-reaction', userId, username, messageId, reaction]);
+      return { messageId: Number(messageId), reactions: [{ reaction, count: 1 }], viewerReaction: reaction };
+    },
+    async setCommunityReaction(userId, name, messageId, reaction) {
+      domainCalls.push(['community-reaction', userId, name, messageId, reaction]);
+      return { messageId: Number(messageId), reactions: [{ reaction, count: 1 }], viewerReaction: reaction };
     },
     ...serviceOverrides.chatService,
   };
@@ -563,5 +584,84 @@ describe('community, social, notification, and chat API', () => {
     assert.equal(direct.status, 200);
     assert.deepEqual(domainCalls[0], ['community-messages', 1, 'artificial', 20, 0]);
     assert.deepEqual(domainCalls[1], ['direct-messages', 1, 'other_user', 20, 0]);
+  });
+
+  it('returns the authenticated mutual-follow inbox conversation list', async () => {
+    const { app, domainCalls } = setup();
+    const response = await request(app)
+      .get('/api/chats/conversations?limit=30')
+      .set('Cookie', 'reddit_session=login-token');
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { success: true, conversations: [], nextCursor: null });
+    assert.deepEqual(domainCalls[0], ['conversations', 1, 30, 0]);
+  });
+
+  it('returns the inbox-specific error when conversations are requested while signed out', async () => {
+    const { app } = setup();
+    const response = await request(app).get('/api/chats/conversations');
+
+    assert.equal(response.status, 401);
+    assert.deepEqual(response.body, {
+      success: false,
+      error: 'You must be logged in to view messages.',
+    });
+  });
+
+  it('marks direct and community messages as read', async () => {
+    const { app, domainCalls } = setup();
+    const direct = await request(app)
+      .post('/api/chats/conversations/other_user/read')
+      .set('Cookie', 'reddit_session=login-token');
+    const community = await request(app)
+      .post('/api/chats/communities/artificial/read')
+      .set('Cookie', 'reddit_session=login-token');
+
+    assert.equal(direct.status, 200);
+    assert.equal(community.status, 200);
+    assert.deepEqual(domainCalls, [
+      ['direct-read', 1, 'other_user'],
+      ['community-read', 1, 'artificial'],
+    ]);
+  });
+
+  it('sets reactions on direct and community chat messages', async () => {
+    const { app, domainCalls } = setup();
+    const direct = await request(app)
+      .put('/api/chats/users/other_user/messages/12/reaction')
+      .set('Cookie', 'reddit_session=login-token')
+      .send({ reaction: 'love' });
+    const community = await request(app)
+      .put('/api/chats/communities/artificial/messages/7/reaction')
+      .set('Cookie', 'reddit_session=login-token')
+      .send({ reaction: 'laugh' });
+
+    assert.equal(direct.status, 200);
+    assert.equal(community.status, 200);
+    assert.deepEqual(domainCalls, [
+      ['direct-reaction', 1, 'other_user', '12', 'love'],
+      ['community-reaction', 1, 'artificial', '7', 'laugh'],
+    ]);
+  });
+});
+
+describe('chat reaction validation', () => {
+  it('rejects reaction values outside the five supported chat reactions', async () => {
+    const db = {
+      async query(sql) {
+        if (sql.includes('SELECT id FROM direct_messages')) return { rows: [{ id: 12 }] };
+        throw new Error('Reaction insert must not occur for an invalid value.');
+      },
+    };
+    const service = new ChatService(db, {}, {
+      async requireMutualFollow() {
+        return { id: 2, username: 'other_user' };
+      },
+    });
+
+    await assert.rejects(
+      service.setDirectReaction(1, 'other_user', 12, 'fire'),
+      (error) => error instanceof HttpError && error.status === 400,
+    );
   });
 });

@@ -4,6 +4,7 @@ import { nextCursor } from '../http/query.js';
 export class SocialService {
   constructor(db) {
     this.db = db;
+    this.onMutualFollow = null;
   }
 
   async targetUser(username) {
@@ -22,6 +23,13 @@ export class SocialService {
       'INSERT INTO user_follows (follower_id, followed_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
       [followerId, target.id],
     );
+    const mutual = await this.db.query(
+      'SELECT 1 FROM user_follows WHERE follower_id = $1 AND followed_id = $2',
+      [target.id, followerId],
+    );
+    if (mutual.rows[0] && this.onMutualFollow) {
+      await this.onMutualFollow(Number(followerId), target.id);
+    }
     return { username: target.username, isFollowing: true };
   }
 
@@ -93,4 +101,3 @@ export class SocialService {
     }
   }
 }
-
