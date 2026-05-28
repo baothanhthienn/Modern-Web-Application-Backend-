@@ -9,12 +9,19 @@ import { createDatabase } from './db.js';
 import { SocialService } from './social/social.service.js';
 
 const db = createDatabase(config);
-const app = createApp({ config, db });
-const server = createServer(app);
 const authService = new AuthService(db, config);
 const communityService = new CommunityService(db);
 const socialService = new SocialService(db);
 const chatService = new ChatService(db, communityService, socialService);
+const app = createApp({
+  config,
+  db,
+  authService,
+  communityService,
+  socialService,
+  chatService,
+});
+const server = createServer(app);
 const io = attachSocketServer(server, { config, authService, chatService });
 
 server.listen(config.port, () => {

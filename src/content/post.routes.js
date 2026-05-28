@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { requiredRequestUser, optionalRequestUser } from '../http/request-auth.js';
 import { cursorOffset, parseLimit } from '../http/query.js';
-import { parseFeedSort, validatePost, validateVote } from './post.validation.js';
+import { parseFeedSort, validatePost, validatePostUpdate, validateVote } from './post.validation.js';
 
 function asyncRoute(handler) {
   return (request, response, next) => Promise.resolve(handler(request, response, next)).catch(next);
@@ -31,6 +31,18 @@ export function createPostRouter({ postService, authService, config }) {
     const user = await optionalRequestUser(request, authService, config);
     const post = await postService.get(request.params.postId, user?.id ?? null);
     response.json({ success: true, post });
+  }));
+
+  router.patch('/:postId', asyncRoute(async (request, response) => {
+    const user = await requiredRequestUser(request, authService, config);
+    const post = await postService.update(user.id, request.params.postId, validatePostUpdate(request.body));
+    response.json({ success: true, post });
+  }));
+
+  router.delete('/:postId', asyncRoute(async (request, response) => {
+    const user = await requiredRequestUser(request, authService, config);
+    await postService.delete(user.id, request.params.postId);
+    response.json({ success: true });
   }));
 
   router.put('/:postId/vote', asyncRoute(async (request, response) => {
@@ -68,4 +80,3 @@ export function createSearchRouter({ postService }) {
 
   return router;
 }
-

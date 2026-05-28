@@ -12,7 +12,14 @@ function integerValue(value, fallback) {
 
 export function createConfig(env = process.env) {
   const isProduction = env.NODE_ENV === 'production';
-  const sameSite = env.COOKIE_SAME_SITE || (isProduction ? 'none' : 'lax');
+  const isRailway = Boolean(
+    env.RAILWAY_ENVIRONMENT ||
+    env.RAILWAY_ENVIRONMENT_NAME ||
+    env.RAILWAY_PUBLIC_DOMAIN ||
+    env.RAILWAY_SERVICE_NAME,
+  );
+  const isHosted = isProduction || isRailway;
+  const sameSite = env.COOKIE_SAME_SITE || (isHosted ? 'none' : 'lax');
 
   if (!['lax', 'strict', 'none'].includes(sameSite)) {
     throw new Error('COOKIE_SAME_SITE must be lax, strict, or none.');
@@ -21,6 +28,7 @@ export function createConfig(env = process.env) {
   return {
     env: env.NODE_ENV || 'development',
     isProduction,
+    isHosted,
     port: integerValue(env.PORT, 3000),
     databaseUrl: env.DATABASE_URL,
     databaseSsl: booleanValue(env.DATABASE_SSL, isProduction),
@@ -34,7 +42,7 @@ export function createConfig(env = process.env) {
       .filter(Boolean),
     sessionCookieName: env.SESSION_COOKIE_NAME || 'reddit_session',
     sessionTtlMs: integerValue(env.SESSION_TTL_SECONDS, 30 * 24 * 60 * 60) * 1000,
-    cookieSecure: booleanValue(env.COOKIE_SECURE, isProduction),
+    cookieSecure: booleanValue(env.COOKIE_SECURE, isHosted),
     cookieSameSite: sameSite,
     profileReadRateLimit: integerValue(env.PROFILE_READ_RATE_LIMIT, 120),
     profileReadRateWindowMs: integerValue(env.PROFILE_READ_RATE_WINDOW_SECONDS, 60) * 1000,

@@ -2,9 +2,12 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import request from 'supertest';
 import { createApp } from '../src/app.js';
+import { ChatService } from '../src/chat/chat.service.js';
 import { createConfig } from '../src/config.js';
+import { PostService } from '../src/content/post.service.js';
 import { HttpError } from '../src/errors.js';
 import { ProfileService } from '../src/profile/profile.service.js';
+import { SocialService } from '../src/social/social.service.js';
 
 const user = {
   id: 1,
@@ -25,6 +28,27 @@ const publicProfile = {
   cakeDay: '2026-05-25T00:00:00.000Z',
   communities: [],
 };
+
+describe('deployment configuration', () => {
+  it('defaults Railway sessions to cross-site secure cookies without relying on NODE_ENV', () => {
+    const config = createConfig({
+      RAILWAY_ENVIRONMENT_NAME: 'production',
+      FRONTEND_ORIGIN: 'https://frontend.example',
+    });
+
+    assert.equal(config.isHosted, true);
+    assert.equal(config.cookieSecure, true);
+    assert.equal(config.cookieSameSite, 'none');
+  });
+
+  it('retains lax non-secure cookie defaults for local development', () => {
+    const config = createConfig({ FRONTEND_ORIGIN: 'http://localhost:5173' });
+
+    assert.equal(config.isHosted, false);
+    assert.equal(config.cookieSecure, false);
+    assert.equal(config.cookieSameSite, 'lax');
+  });
+});
 
 function setup(authOverrides = {}, profileOverrides = {}, serviceOverrides = {}) {
   const calls = [];
@@ -79,6 +103,13 @@ function setup(authOverrides = {}, profileOverrides = {}, serviceOverrides = {})
       domainCalls.push(['create-post', userId, details]);
       return { id: 9, title: details.title, community: details.community };
     },
+    async update(userId, postId, details) {
+      domainCalls.push(['update-post', userId, postId, details]);
+      return { id: Number(postId), ...details };
+    },
+    async delete(userId, postId) {
+      domainCalls.push(['delete-post', userId, postId]);
+    },
     async search(query, limit) {
       domainCalls.push(['search', query, limit]);
       return { users: [], posts: [] };
@@ -112,6 +143,14 @@ function setup(authOverrides = {}, profileOverrides = {}, serviceOverrides = {})
     ...serviceOverrides.socialService,
   };
   const chatService = {
+    async conversations(userId, limit, offset) {
+      domainCalls.push(['conversations', userId, limit, offset]);
+      return { conversations: [], nextCursor: null };
+    },
+    async markDirectRead(userId, username) {
+      domainCalls.push(['direct-read', userId, username]);
+      return { with: username, messageIds: [12], readAt: '2026-05-26T00:00:00.000Z' };
+    },
     async communityHistory(userId, name, limit, offset) {
       domainCalls.push(['community-messages', userId, name, limit, offset]);
       return { community: name, messages: [], nextCursor: null };
@@ -119,6 +158,18 @@ function setup(authOverrides = {}, profileOverrides = {}, serviceOverrides = {})
     async directHistory(userId, username, limit, offset) {
       domainCalls.push(['direct-messages', userId, username, limit, offset]);
       return { with: username, messages: [], nextCursor: null };
+    },
+    async markCommunityRead(userId, name) {
+      domainCalls.push(['community-read', userId, name]);
+      return { community: name, messageIds: [7], readAt: '2026-05-26T00:00:00.000Z' };
+    },
+    async setDirectReaction(userId, username, messageId, reaction) {
+      domainCalls.push(['direct-reaction', userId, username, messageId, reaction]);
+      return { messageId: Number(messageId), reactions: [{ reaction, count: 1 }], viewerReaction: reaction };
+    },
+    async setCommunityReaction(userId, name, messageId, reaction) {
+      domainCalls.push(['community-reaction', userId, name, messageId, reaction]);
+      return { messageId: Number(messageId), reactions: [{ reaction, count: 1 }], viewerReaction: reaction };
     },
     ...serviceOverrides.chatService,
   };
@@ -481,6 +532,36 @@ describe('home page and post API', () => {
     }]);
   });
 
+  it('updates a post through an authenticated author-only endpoint', async () => {
+    const { app, domainCalls } = setup();
+    const response = await request(app)
+      .patch('/api/posts/9')
+      .set('Cookie', 'reddit_session=login-token')
+      .send({
+        title: 'Updated quantum computing title',
+        description: 'Updated description.',
+        image: null,
+      });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(domainCalls[0], ['update-post', 1, '9', {
+      title: 'Updated quantum computing title',
+      text: 'Updated description.',
+      image: null,
+    }]);
+  });
+
+  it('deletes a post through an authenticated author-only endpoint', async () => {
+    const { app, domainCalls } = setup();
+    const response = await request(app)
+      .delete('/api/posts/9')
+      .set('Cookie', 'reddit_session=login-token');
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { success: true });
+    assert.deepEqual(domainCalls[0], ['delete-post', 1, '9']);
+  });
+
   it('searches usernames and post titles', async () => {
     const { app, domainCalls } = setup();
     const response = await request(app).get('/api/search?q=tech&limit=10');
@@ -488,6 +569,50 @@ describe('home page and post API', () => {
     assert.equal(response.status, 200);
     assert.equal(response.body.query, 'tech');
     assert.deepEqual(domainCalls[0], ['search', 'tech', 10]);
+  });
+});
+
+describe('post ownership enforcement', () => {
+  it('does not update a public post unless it belongs to the authenticated user', async () => {
+    let updateSql = '';
+    let updateParameters = [];
+    const service = new PostService({
+      async transaction(work) {
+        return work({
+          async query(sql, parameters) {
+            updateSql = sql;
+            updateParameters = parameters;
+            return { rows: [] };
+          },
+        });
+      },
+    });
+
+    await assert.rejects(
+      service.update(1, 9, { title: 'Edited title' }),
+      (error) => error instanceof HttpError && error.status === 404,
+    );
+    assert.match(updateSql, /author_id = \$2/);
+    assert.deepEqual(updateParameters.slice(0, 2), [9, 1]);
+  });
+
+  it('does not delete a public post unless it belongs to the authenticated user', async () => {
+    let deleteSql = '';
+    let deleteParameters = [];
+    const service = new PostService({
+      async query(sql, parameters) {
+        deleteSql = sql;
+        deleteParameters = parameters;
+        return { rows: [] };
+      },
+    });
+
+    await assert.rejects(
+      service.delete(1, 9),
+      (error) => error instanceof HttpError && error.status === 404,
+    );
+    assert.match(deleteSql, /author_id = \$2/);
+    assert.deepEqual(deleteParameters, [9, 1]);
   });
 });
 
@@ -542,5 +667,275 @@ describe('community, social, notification, and chat API', () => {
     assert.equal(direct.status, 200);
     assert.deepEqual(domainCalls[0], ['community-messages', 1, 'artificial', 20, 0]);
     assert.deepEqual(domainCalls[1], ['direct-messages', 1, 'other_user', 20, 0]);
+  });
+
+  it('returns the authenticated mutual-follow inbox conversation list', async () => {
+    const { app, domainCalls } = setup();
+    const response = await request(app)
+      .get('/api/chats/conversations?limit=30')
+      .set('Cookie', 'reddit_session=login-token');
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { success: true, conversations: [], nextCursor: null });
+    assert.deepEqual(domainCalls[0], ['conversations', 1, 30, 0]);
+  });
+
+  it('returns the inbox-specific error when conversations are requested while signed out', async () => {
+    const { app } = setup();
+    const response = await request(app).get('/api/chats/conversations');
+
+    assert.equal(response.status, 401);
+    assert.deepEqual(response.body, {
+      success: false,
+      error: 'You must be logged in to view messages.',
+    });
+  });
+
+  it('marks direct and community messages as read', async () => {
+    const { app, domainCalls } = setup();
+    const direct = await request(app)
+      .post('/api/chats/conversations/other_user/read')
+      .set('Cookie', 'reddit_session=login-token');
+    const community = await request(app)
+      .post('/api/chats/communities/artificial/read')
+      .set('Cookie', 'reddit_session=login-token');
+
+    assert.equal(direct.status, 200);
+    assert.equal(community.status, 200);
+    assert.deepEqual(domainCalls, [
+      ['direct-read', 1, 'other_user'],
+      ['community-read', 1, 'artificial'],
+    ]);
+  });
+
+  it('sets reactions on direct and community chat messages', async () => {
+    const { app, domainCalls } = setup();
+    const direct = await request(app)
+      .put('/api/chats/users/other_user/messages/12/reaction')
+      .set('Cookie', 'reddit_session=login-token')
+      .send({ reaction: 'love' });
+    const community = await request(app)
+      .put('/api/chats/communities/artificial/messages/7/reaction')
+      .set('Cookie', 'reddit_session=login-token')
+      .send({ reaction: 'laugh' });
+
+    assert.equal(direct.status, 200);
+    assert.equal(community.status, 200);
+    assert.deepEqual(domainCalls, [
+      ['direct-reaction', 1, 'other_user', '12', 'love'],
+      ['community-reaction', 1, 'artificial', '7', 'laugh'],
+    ]);
+  });
+});
+
+describe('chat reaction validation', () => {
+  it('rejects reaction values outside the five supported chat reactions', async () => {
+    const db = {
+      async query(sql) {
+        if (sql.includes('SELECT id FROM direct_messages')) return { rows: [{ id: 12 }] };
+        throw new Error('Reaction insert must not occur for an invalid value.');
+      },
+    };
+    const service = new ChatService(db, {}, {
+      async requireMutualFollow() {
+        return { id: 2, username: 'other_user' };
+      },
+    });
+
+    await assert.rejects(
+      service.setDirectReaction(1, 'other_user', 12, 'fire'),
+      (error) => error instanceof HttpError && error.status === 400,
+    );
+  });
+});
+
+describe('follow notifications', () => {
+  it('notifies the followed user before the follow becomes mutual', async () => {
+    const notifications = [];
+    const service = new SocialService({
+      async query(sql) {
+        if (sql.includes('SELECT id, username FROM users WHERE LOWER')) {
+          return { rows: [{ id: '2', username: 'bob' }] };
+        }
+        if (sql.includes('INSERT INTO user_follows')) {
+          return { rows: [{ follower_id: '1' }] };
+        }
+        if (sql.includes('SELECT 1 FROM user_follows')) return { rows: [] };
+        if (sql.includes('SELECT username FROM users WHERE id')) {
+          return { rows: [{ username: 'alice' }] };
+        }
+        if (sql.includes("'new_follower'")) {
+          return {
+            rows: [{
+              id: '40',
+              user_id: '2',
+              type: 'new_follower',
+              actor_id: '1',
+              related_user_id: '1',
+              message: 'u/alice followed you.',
+              post_id: null,
+              read_at: null,
+              created_at: new Date('2026-05-26T10:00:00.000Z'),
+            }],
+          };
+        }
+        throw new Error('Unexpected query');
+      },
+    });
+    service.onNotification = async (userId, notification) => notifications.push({ userId, notification });
+
+    await service.follow(1, 'bob');
+
+    assert.deepEqual(notifications, [{
+      userId: 2,
+      notification: {
+        id: 40,
+        type: 'new_follower',
+        message: 'u/alice followed you.',
+        postId: null,
+        actor: 'alice',
+        targetUsername: 'alice',
+        read: false,
+        createdAt: '2026-05-26T10:00:00.000Z',
+      },
+    }]);
+  });
+
+  it('adds mutual-chat notifications once when a reciprocal follow is established', async () => {
+    let insertedFollow = false;
+    let newFollowerWrites = 0;
+    let mutualWrites = 0;
+    const callbackCalls = [];
+    const createdAt = new Date('2026-05-26T10:20:30.000Z');
+    const service = new SocialService({
+      async query(sql) {
+        if (sql.includes('SELECT id, username FROM users WHERE LOWER')) {
+          return { rows: [{ id: '2', username: 'bob' }] };
+        }
+        if (sql.includes('INSERT INTO user_follows')) {
+          if (insertedFollow) return { rows: [] };
+          insertedFollow = true;
+          return { rows: [{ follower_id: '1' }] };
+        }
+        if (sql.includes('SELECT 1 FROM user_follows')) return { rows: [{ '?column?': 1 }] };
+        if (sql.includes('SELECT username FROM users WHERE id')) {
+          return { rows: [{ username: 'alice' }] };
+        }
+        if (sql.includes("'new_follower'")) {
+          newFollowerWrites += 1;
+          return {
+            rows: [{
+              id: '41',
+              user_id: '2',
+              type: 'new_follower',
+              actor_id: '1',
+              related_user_id: '1',
+              message: 'u/alice followed you.',
+              post_id: null,
+              read_at: null,
+              created_at: createdAt,
+            }],
+          };
+        }
+        if (sql.includes('SELECT id, username FROM users WHERE id IN')) {
+          return { rows: [{ id: '1', username: 'alice' }, { id: '2', username: 'bob' }] };
+        }
+        if (sql.includes("'mutual_follow'")) {
+          mutualWrites += 1;
+          return {
+            rows: [
+              {
+                id: '42',
+                user_id: '1',
+                type: 'mutual_follow',
+                actor_id: '2',
+                related_user_id: '2',
+                message: 'You and u/bob now follow each other. You can start chatting.',
+                post_id: null,
+                read_at: null,
+                created_at: createdAt,
+              },
+              {
+                id: '43',
+                user_id: '2',
+                type: 'mutual_follow',
+                actor_id: '1',
+                related_user_id: '1',
+                message: 'You and u/alice now follow each other. You can start chatting.',
+                post_id: null,
+                read_at: null,
+                created_at: createdAt,
+              },
+            ],
+          };
+        }
+        throw new Error('Unexpected query');
+      },
+    });
+    service.onMutualFollow = async (...arguments_) => callbackCalls.push(arguments_);
+
+    await service.follow(1, 'bob');
+    await service.follow(1, 'bob');
+
+    assert.equal(newFollowerWrites, 1);
+    assert.equal(mutualWrites, 1);
+    assert.equal(callbackCalls.length, 1);
+    assert.deepEqual(callbackCalls[0][2][0].notification, {
+      id: 42,
+      type: 'mutual_follow',
+      message: 'You and u/bob now follow each other. You can start chatting.',
+      postId: null,
+      actor: 'bob',
+      targetUsername: 'bob',
+      read: false,
+      createdAt: '2026-05-26T10:20:30.000Z',
+    });
+  });
+
+  it('returns targetUsername for user-related notification items', async () => {
+    const service = new SocialService({
+      async query() {
+        return {
+          rows: [
+            {
+              id: '41',
+              type: 'new_follower',
+              message: 'u/bob followed you.',
+              post_id: null,
+              read_at: null,
+              created_at: new Date('2026-05-26T10:19:30.000Z'),
+              actor: 'bob',
+              target_username: 'bob',
+            },
+            {
+              id: '42',
+              type: 'mutual_follow',
+              message: 'Chat available.',
+              post_id: null,
+              read_at: null,
+              created_at: new Date('2026-05-26T10:20:30.000Z'),
+              actor: 'bob',
+              target_username: 'bob',
+            },
+            {
+              id: '43',
+              type: 'post_created',
+              message: 'Published.',
+              post_id: '9',
+              read_at: null,
+              created_at: new Date('2026-05-26T10:21:30.000Z'),
+              actor: 'alice',
+              target_username: null,
+            },
+          ],
+        };
+      },
+    });
+
+    const result = await service.notifications(1, 20, 0);
+
+    assert.equal(result.notifications[0].targetUsername, 'bob');
+    assert.equal(result.notifications[1].targetUsername, 'bob');
+    assert.equal(result.notifications[2].targetUsername, null);
   });
 });

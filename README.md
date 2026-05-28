@@ -52,6 +52,79 @@ const response = await fetch(`${API_BASE_URL}/auth/session`, {
 });
 ```
 
+## Local Frontend Against Deployed API
+
+Use this workflow when the backend runs on Railway and the Vite frontend
+stays on `http://localhost:5173`.
+
+### Recommended: Vite Dev Proxy
+
+Proxy API and Socket.IO through the Vite dev server so the browser treats
+requests as same-origin. This avoids cross-site cookie restrictions.
+
+`vite.config.js`:
+
+```js
+export default defineConfig({
+  server: {
+    proxy: {
+      '/api': {
+        target: 'https://<railway-api-domain>',
+        changeOrigin: true,
+        secure: true,
+      },
+      '/socket.io': {
+        target: 'https://<railway-api-domain>',
+        changeOrigin: true,
+        ws: true,
+        secure: true,
+      },
+    },
+  },
+});
+```
+
+Frontend `.env.local`:
+
+```text
+VITE_API_BASE_URL=/api
+```
+
+Keep `credentials: 'include'` on fetch calls and `withCredentials: true` on
+Socket.IO. Connect Socket.IO to the Vite origin (for example `io()` with no
+remote URL), not directly to the Railway host.
+
+Railway still needs `FRONTEND_ORIGIN=http://localhost:5173` for proxied
+WebSocket handshakes. Do not copy `COOKIE_SAME_SITE=lax` from `.env.example`
+into Railway; hosted deploys should use `none` and `Secure` (the default when
+Railway variables are present).
+
+### Alternative: Call Railway Directly
+
+Point the frontend at the deployed API:
+
+```text
+VITE_API_BASE_URL=https://<railway-api-domain>/api
+```
+
+Railway variables:
+
+```text
+FRONTEND_ORIGIN=https://<production-frontend>,http://localhost:5173
+COOKIE_SECURE=true
+COOKIE_SAME_SITE=none
+```
+
+Do not set `COOKIE_SAME_SITE=lax` or `COOKIE_SECURE=false` on Railway. Those
+values prevent the browser from sending the session cookie from localhost to
+the deployed API.
+
+Verify in DevTools:
+
+1. `POST .../api/auth/login` returns `200` and `Set-Cookie: reddit_session=...`.
+2. The next `GET .../api/auth/session` includes `Cookie: reddit_session=...`.
+3. `401` on `/api/auth/session` before login, or after logout, is normal.
+
 Use clean Express routes only. Do not call any former `.php` routes.
 
 ```text
@@ -65,6 +138,8 @@ GET  /api/me/saved?limit=20&cursor=<cursor>
 GET  /api/posts?sort=best&limit=20&cursor=<cursor>
 POST /api/posts
 GET  /api/posts/:postId
+PATCH /api/posts/:postId
+DELETE /api/posts/:postId
 PUT  /api/posts/:postId/vote
 PUT  /api/posts/:postId/saved
 DELETE /api/posts/:postId/saved
@@ -76,6 +151,13 @@ POST /api/profiles/:username/follow
 DELETE /api/profiles/:username/follow
 GET  /api/chats/communities/:name/messages
 GET  /api/chats/users/:username/messages
+GET  /api/chats/conversations?limit=30&cursor=<cursor>
+POST /api/chats/conversations/:username/read
+POST /api/chats/communities/:name/read
+PUT  /api/chats/users/:username/messages/:messageId/reaction
+DELETE /api/chats/users/:username/messages/:messageId/reaction
+PUT  /api/chats/communities/:name/messages/:messageId/reaction
+DELETE /api/chats/communities/:name/messages/:messageId/reaction
 GET  /api/notifications
 PATCH /api/me/username
 GET  /api/health
@@ -144,6 +226,35 @@ For a separately hosted frontend and API:
 - Backend must set `FRONTEND_ORIGIN` to the exact frontend origin.
 - Backend must use `COOKIE_SECURE=true` and `COOKIE_SAME_SITE=none`.
 - Frontend requests must use `credentials: 'include'`.
+
+### Diagnosing `401` In Deployment
+
+A browser console message saying a resource returned `401` is not enough to
+identify a backend fault. Inspect the failed request URL and JSON body:
+
+| Request | When `401` Is Expected |
+| --- | --- |
+| `GET /api/auth/session` | A guest opens the application or a saved session expired. The frontend should clear auth state without showing a fatal error. |
+| `GET /api/me/saved` | A user is not logged in but attempts to view Saved. |
+| `GET /api/notifications` | A user is not logged in but attempts to load notifications. |
+| Socket.IO connection | The chat socket was created without a current login session cookie. Do not connect chat for guest users. |
+
+If `POST /api/auth/login` returns `200` but the immediately following
+`GET /api/auth/session`, notifications request, or chat socket fails with
+`401`, the browser did not store or send the session cookie. For a frontend
+and Railway API on different sites, verify:
+
+```text
+FRONTEND_ORIGIN=https://<exact-frontend-domain>
+COOKIE_SECURE=true
+COOKIE_SAME_SITE=none
+```
+
+Railway runtime variables are now detected automatically so deployed session
+cookies default to `Secure` and `SameSite=None` even when `NODE_ENV` was not
+set. Explicit `COOKIE_*` variables still override those defaults. The
+frontend must continue using `credentials: 'include'` for API requests and
+`withCredentials: true` for Socket.IO.
 
 ## API Endpoints
 
@@ -615,8 +726,91 @@ Success, `201 Created`:
 ```
 
 Creating a post also inserts a `post_created` notification for the author.
-Only HTTPS image URLs are accepted. Link posts, post editing, comments, and
-reactions are reserved for later endpoints.
+Only HTTPS image URLs are accepted. Link posts, comments, and reactions are
+reserved for later endpoints.
+
+### Edit Or Delete Own Post
+
+Only the authenticated author of a public post can edit or delete it. Requests
+by another user return `404` so the API does not disclose private ownership
+details. The frontend should show edit and delete controls only when the
+signed-in session username matches the post `author`; the backend still
+performs the authoritative ownership check.
+
+Update one or more editable fields:
+
+```http
+PATCH /api/posts/:postId
+Content-Type: application/json
+```
+
+```json
+{
+  "title": "Updated title",
+  "description": "Updated description.",
+  "image": "https://images.example/updated-post.jpg",
+  "community": "technology"
+}
+```
+
+The editable fields are `title`, `description`/`text`, `image`/`imageUrl`,
+and `community`. Use `null` for `description` or `image` to remove it. Fields
+not supplied are retained. Success, `200 OK`, returns the same complete post
+object shape returned by the feed and post-detail endpoint:
+
+```json
+{
+  "success": true,
+  "post": {
+    "id": 1,
+    "community": "technology",
+    "communityColor": "#A855F7",
+    "author": "tech_guru",
+    "createdAt": "2026-05-25T03:15:00.000Z",
+    "flair": null,
+    "flairColor": null,
+    "title": "Updated title",
+    "image": "https://images.example/updated-post.jpg",
+    "text": "Updated description.",
+    "link": null,
+    "linkDomain": null,
+    "votes": 0,
+    "comments": 0,
+    "reactions": 0,
+    "userVote": 0,
+    "saved": false
+  }
+}
+```
+
+Delete a post:
+
+```http
+DELETE /api/posts/:postId
+```
+
+Success, `200 OK`:
+
+```json
+{ "success": true }
+```
+
+Deletion is soft deletion: the post is marked deleted and no longer appears
+in public feed, post detail, search, profile activity, or saved-item results.
+
+Mutation errors:
+
+```http
+401 Unauthorized
+{ "success": false, "error": "Session expired or invalid." }
+
+404 Not Found
+{ "success": false, "error": "Post not found." }
+```
+
+`404` is returned when the post is absent, already deleted, or belongs to
+another user. Validation errors such as a missing update field or a non-HTTPS
+image URL return `400` with a user-facing `error` message.
 
 ### Post Viewer Actions
 
@@ -728,6 +922,63 @@ Success response:
 }
 ```
 
+### Inbox Conversations
+
+The Inbox page discovers eligible direct conversations using:
+
+```http
+GET /api/chats/conversations?limit=30&cursor=<opaque-cursor>
+```
+
+This route requires authentication and returns only mutual follows. A
+conversation appears immediately when mutual follow authorization exists,
+even if no messages have been sent.
+
+```json
+{
+  "success": true,
+  "conversations": [
+    {
+      "username": "other_user",
+      "displayName": "Other User",
+      "avatarUrl": null,
+      "lastMessage": {
+        "id": 12,
+        "sender": "other_user",
+        "body": "See you there.",
+        "createdAt": "2026-05-26T01:20:00.000Z"
+      },
+      "unreadCount": 1
+    },
+    {
+      "username": "new_mutual",
+      "displayName": null,
+      "avatarUrl": null,
+      "lastMessage": null,
+      "unreadCount": 0
+    }
+  ],
+  "nextCursor": null
+}
+```
+
+Conversations sort by latest message descending; mutual follows with no
+messages appear after messaged conversations. When signed out:
+
+```json
+{ "success": false, "error": "You must be logged in to view messages." }
+```
+
+An open Socket.IO connection receives:
+
+```text
+direct:conversation  { "conversation": <conversation-object> }
+```
+
+The server emits this after a direct message updates a preview, after a read
+operation changes unread state through Socket.IO, and when a follow action
+creates mutual authorization.
+
 ### Message History
 
 Both message-history endpoints require authentication and return stored
@@ -760,6 +1011,100 @@ Direct history returns `403` unless the two users mutually follow.
 For direct messages, the response replaces `community` with
 `"with": "other_user"`.
 
+Messages returned from chat history and new-message socket events include
+message state:
+
+```json
+{
+  "id": 12,
+  "sender": "other_user",
+  "body": "See you there.",
+  "createdAt": "2026-05-26T01:20:00.000Z",
+  "seen": true,
+  "seenAt": "2026-05-26T01:21:00.000Z",
+  "reactions": [
+    { "reaction": "love", "count": 2 }
+  ],
+  "viewerReaction": "love"
+}
+```
+
+For community messages, `seenAt` is replaced by `seenByCount`, the number of
+other members who have marked that message read.
+
+### Seen And Unread State
+
+When the user opens a visible direct conversation, mark incoming messages as
+read through REST:
+
+```http
+POST /api/chats/conversations/:username/read
+```
+
+For a community room:
+
+```http
+POST /api/chats/communities/:name/read
+```
+
+Example response:
+
+```json
+{
+  "success": true,
+  "with": "other_user",
+  "messageIds": [12, 13],
+  "readAt": "2026-05-26T01:21:00.000Z"
+}
+```
+
+For immediate sender-side seen indicators while both users are online, emit
+the equivalent Socket.IO events documented below. Direct-message unread
+counts in `/api/chats/conversations` are derived from persisted `read_at`.
+
+### Message Reactions
+
+Each user may choose at most one reaction per message. Setting a different
+reaction replaces their current selection; deleting it removes their
+selection. The server accepts exactly these five reaction identifiers:
+
+```text
+like
+love
+laugh
+surprised
+sad
+```
+
+The frontend chooses the matching icon presentation. Any other reaction is
+rejected with `400`.
+
+REST routes:
+
+```http
+PUT    /api/chats/users/:username/messages/:messageId/reaction
+DELETE /api/chats/users/:username/messages/:messageId/reaction
+PUT    /api/chats/communities/:name/messages/:messageId/reaction
+DELETE /api/chats/communities/:name/messages/:messageId/reaction
+```
+
+Set request body:
+
+```json
+{ "reaction": "love" }
+```
+
+Success:
+
+```json
+{
+  "success": true,
+  "messageId": 12,
+  "reactions": [{ "reaction": "love", "count": 2 }],
+  "viewerReaction": "love"
+}
+```
+
 ### Socket.IO Realtime Messages
 
 Connect Socket.IO to the same backend host with the session cookie included:
@@ -780,6 +1125,13 @@ Community events:
 | client -> server | `community:leave` | `{ "community": "artificial" }` |
 | client -> server | `community:message:send` | `{ "community": "artificial", "body": "Hello" }` |
 | server -> client | `community:message` | `{ "community": "artificial", "message": { ... } }` |
+| client -> server | `community:typing` | `{ "community": "artificial", "isTyping": true }` |
+| server -> room | `community:typing` | `{ "community": "artificial", "username": "sample_user", "isTyping": true }` |
+| client -> server | `community:read` | `{ "community": "artificial" }` |
+| server -> room | `community:read` | `{ "community": "artificial", "messageIds": [1], "readAt": "...", "username": "sample_user" }` |
+| client -> server | `community:reaction:set` | `{ "community": "artificial", "messageId": 1, "reaction": "love" }` |
+| client -> server | `community:reaction:remove` | `{ "community": "artificial", "messageId": 1 }` |
+| server -> room | `community:reaction` | `{ "community": "artificial", "messageId": 1, "reactions": [...], "actor": "sample_user", "actorReaction": "love" }` |
 
 Direct message events:
 
@@ -789,6 +1141,14 @@ Direct message events:
 | client -> server | `direct:leave` | `{ "username": "other_user" }` |
 | client -> server | `direct:message:send` | `{ "username": "other_user", "body": "Hello" }` |
 | server -> client | `direct:message` | `{ "with": "other_user", "message": { ... } }` |
+| client -> server | `direct:typing` | `{ "username": "other_user", "isTyping": true }` |
+| server -> room | `direct:typing` | `{ "with": "other_user", "username": "other_user", "isTyping": true }` |
+| client -> server | `direct:read` | `{ "username": "other_user" }` |
+| server -> room | `direct:read` | `{ "with": "other_user", "messageIds": [12], "readAt": "...", "by": "other_user" }` |
+| client -> server | `direct:reaction:set` | `{ "username": "other_user", "messageId": 12, "reaction": "love" }` |
+| client -> server | `direct:reaction:remove` | `{ "username": "other_user", "messageId": 12 }` |
+| server -> room | `direct:reaction` | `{ "with": "other_user", "messageId": 12, "reactions": [...], "actor": "other_user", "actorReaction": "love" }` |
+| server -> client | `direct:conversation` | `{ "conversation": { ... } }` |
 
 Send/join events accept Socket.IO acknowledgements. A successful
 acknowledgement begins with `{ "success": true }`; authorization or validation
@@ -811,8 +1171,15 @@ require mutual follows.
 
 ## Notifications API
 
-When an authenticated user creates a post, the backend creates a notification
-for that user. Fetch the notification page data with:
+The backend creates notifications for:
+
+- `post_created`: the signed-in user publishes a post.
+- `new_follower`: another user starts following the signed-in user; this does
+  not require a reciprocal follow.
+- `mutual_follow`: a second follow completes a reciprocal follow relationship,
+  enabling direct chat for both users.
+
+Fetch notification page data with:
 
 ```http
 GET /api/notifications?limit=20&cursor=<cursor>
@@ -830,11 +1197,63 @@ GET /api/notifications?limit=20&cursor=<cursor>
       "actor": "sample_user",
       "read": false,
       "createdAt": "2026-05-25T03:15:00.000Z"
+    },
+    {
+      "id": 2,
+      "type": "new_follower",
+      "message": "u/other_user followed you.",
+      "postId": null,
+      "actor": "other_user",
+      "targetUsername": "other_user",
+      "read": false,
+      "createdAt": "2026-05-26T10:19:30.000Z"
+    },
+    {
+      "id": 3,
+      "type": "mutual_follow",
+      "message": "You and u/other_user now follow each other. You can start chatting.",
+      "postId": null,
+      "actor": "other_user",
+      "targetUsername": "other_user",
+      "read": false,
+      "createdAt": "2026-05-26T10:20:30.000Z"
     }
   ],
   "nextCursor": null
 }
 ```
+
+For `new_follower`, only the followed user receives the notification.
+`targetUsername` identifies the new follower; the frontend should use it when
+linking to that user's profile:
+
+```text
+/profile/<targetUsername>
+```
+
+For `mutual_follow`, both users receive one notification. The
+`targetUsername` value is the canonical route target for:
+
+```text
+/inbox?with=<targetUsername>
+```
+
+For notification types without a user target, including `post_created`,
+`targetUsername` is `null`.
+
+Repeated follow requests while an existing follow is active do not generate
+duplicate `new_follower` or `mutual_follow` notifications. If a user
+unfollows, notifications belonging to that active relationship are removed;
+following again creates fresh applicable notifications.
+
+Connected authenticated clients also receive:
+
+```text
+notification:new  { "notification": <notification-object> }
+```
+
+for newly created `new_follower` and `mutual_follow` notifications.
+`direct:conversation` is emitted only when `mutual_follow` enables chat.
 
 ## Current User Details API
 
@@ -878,8 +1297,11 @@ Conflict, `409`:
 | `post_votes`, `saved_posts` | Per-viewer home/profile state. |
 | `user_follows` | Follow records; reciprocal rows authorize direct chat. |
 | `community_messages` | Member-only persisted community messages. |
-| `direct_messages` | Persisted messages between mutually-following users. |
-| `notifications` | Notification page items, including author post-created events. |
+| `community_message_reads` | Per-member community seen state. |
+| `community_message_reactions` | Per-member reactions restricted to five supported values. |
+| `direct_messages` | Persisted messages between mutually-following users, including recipient `read_at`. |
+| `direct_message_reactions` | Per-user direct-message reactions restricted to five supported values. |
+| `notifications` | Notification page items, including post-created, new-follower, and mutual-follow chat-available events; `related_user_id` identifies the related user when applicable. |
 
 ## General Error Responses
 
@@ -950,8 +1372,8 @@ Relevant backend environment variables:
 | `NODE_ENV` | `production` |
 | `DATABASE_URL` | Private PostgreSQL connection string. Never expose to frontend code. |
 | `FRONTEND_ORIGIN` | `https://your-frontend.example` |
-| `COOKIE_SECURE` | `true` for HTTPS deployment. |
-| `COOKIE_SAME_SITE` | `none` when frontend and API are on separate sites. |
+| `COOKIE_SECURE` | `true` for HTTPS deployment. This is the Railway default unless overridden. |
+| `COOKIE_SAME_SITE` | `none` when frontend and API are on separate sites. This is the Railway default unless overridden. |
 | `SESSION_COOKIE_NAME` | Optional; default `reddit_session`. |
 | `SESSION_TTL_SECONDS` | Optional; default `2592000` (30 days). |
 | `PROFILE_READ_RATE_LIMIT` | Optional; default `120` public/profile reads per window. |

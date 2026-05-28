@@ -80,6 +80,25 @@ async function serverFixture() {
       await communityService.requireMembership(name, userId);
       return { community: name, messages: communityMessages, nextCursor: null };
     },
+    async markCommunityRead(userId, name) {
+      await communityService.requireMembership(name, userId);
+      return {
+        community: name,
+        messageIds: communityMessages.map((message) => message.id),
+        readAt: '2026-05-26T00:00:00.000Z',
+      };
+    },
+    async setCommunityReaction(userId, name, messageId, reaction) {
+      await communityService.requireMembership(name, userId);
+      if (!['like', 'love', 'laugh', 'surprised', 'sad'].includes(reaction)) {
+        throw new HttpError(400, 'Reaction must be allowed.');
+      }
+      return { messageId, reactions: [{ reaction, count: 1 }], viewerReaction: reaction };
+    },
+    async removeCommunityReaction(userId, name, messageId) {
+      await communityService.requireMembership(name, userId);
+      return { messageId, reactions: [], viewerReaction: null };
+    },
     async sendDirectMessage(user, username, body) {
       const target = await socialService.requireMutualFollow(user.id, username);
       const message = {
@@ -94,6 +113,35 @@ async function serverFixture() {
     async directHistory(userId, username) {
       await socialService.requireMutualFollow(userId, username);
       return { with: username, messages: directMessages, nextCursor: null };
+    },
+    async markDirectRead(userId, username) {
+      await socialService.requireMutualFollow(userId, username);
+      return {
+        with: username,
+        messageIds: directMessages.map((message) => message.id),
+        readAt: '2026-05-26T00:00:00.000Z',
+      };
+    },
+    async setDirectReaction(userId, username, messageId, reaction) {
+      await socialService.requireMutualFollow(userId, username);
+      if (!['like', 'love', 'laugh', 'surprised', 'sad'].includes(reaction)) {
+        throw new HttpError(400, 'Reaction must be allowed.');
+      }
+      return { messageId, reactions: [{ reaction, count: 1 }], viewerReaction: reaction };
+    },
+    async removeDirectReaction(userId, username, messageId) {
+      await socialService.requireMutualFollow(userId, username);
+      return { messageId, reactions: [], viewerReaction: null };
+    },
+    async conversation(userId, targetId) {
+      const target = Object.values(users).find((entry) => entry.id === Number(targetId));
+      return {
+        username: target.username,
+        displayName: null,
+        avatarUrl: null,
+        lastMessage: null,
+        unreadCount: 0,
+      };
     },
   };
   const app = createApp({
@@ -114,6 +162,7 @@ async function serverFixture() {
   });
   return {
     origin,
+    chatService,
     revokeCommunityAccess(userId) {
       communityMembers.delete(Number(userId));
     },
@@ -146,6 +195,24 @@ function delay(milliseconds = 30) {
 }
 
 describe('Socket.IO chat contract', () => {
+  it('emits a follower notification without requiring reciprocal follow', async () => {
+    const { origin, chatService } = await serverFixture();
+    const bob = await socketClient(origin, 'token-bob');
+    const bobNotification = once(bob, 'notification:new');
+
+    await chatService.socialService.onNotification(2, {
+      type: 'new_follower',
+      actor: 'alice',
+      targetUsername: 'alice',
+    });
+
+    assert.deepEqual((await bobNotification).notification, {
+      type: 'new_follower',
+      actor: 'alice',
+      targetUsername: 'alice',
+    });
+  });
+
   it('delivers one persisted community message to two joined members and REST history', async () => {
     const { origin } = await serverFixture();
     const alice = await socketClient(origin, 'token-alice');
@@ -184,6 +251,29 @@ describe('Socket.IO chat contract', () => {
       .set('Cookie', 'reddit_session=token-bob');
     assert.equal(history.status, 200);
     assert.deepEqual(history.body.messages, [sent.message]);
+
+    const typingEvent = once(alice, 'community:typing');
+    assert.equal((await emitWithAck(bob, 'community:typing', {
+      community: 'artificial',
+      isTyping: true,
+    })).success, true);
+    assert.deepEqual(await typingEvent, {
+      community: 'artificial',
+      username: 'bob',
+      isTyping: true,
+    });
+
+    const readEvent = once(alice, 'community:read');
+    assert.equal((await emitWithAck(bob, 'community:read', { community: 'artificial' })).success, true);
+    assert.equal((await readEvent).username, 'bob');
+
+    const reactionEvent = once(alice, 'community:reaction');
+    assert.equal((await emitWithAck(bob, 'community:reaction:set', {
+      community: 'artificial',
+      messageId: sent.message.id,
+      reaction: 'love',
+    })).success, true);
+    assert.deepEqual((await reactionEvent).reactions, [{ reaction: 'love', count: 1 }]);
   });
 
   it('delivers direct messages to two mutually-following users with recipient-specific conversation names', async () => {
@@ -226,6 +316,40 @@ describe('Socket.IO chat contract', () => {
     assert.equal(history.status, 200);
     assert.deepEqual(history.body.messages, [sent.message]);
 
+    const typingEvent = once(alice, 'direct:typing');
+    assert.equal((await emitWithAck(bob, 'direct:typing', {
+      username: 'alice',
+      isTyping: true,
+    })).success, true);
+    assert.deepEqual(await typingEvent, {
+      with: 'bob',
+      username: 'bob',
+      isTyping: true,
+    });
+
+    const readEvent = once(alice, 'direct:read');
+    assert.equal((await emitWithAck(bob, 'direct:read', { username: 'alice' })).success, true);
+    assert.deepEqual(await readEvent, {
+      with: 'bob',
+      messageIds: [sent.message.id],
+      readAt: '2026-05-26T00:00:00.000Z',
+      by: 'bob',
+    });
+
+    const reactionEvent = once(alice, 'direct:reaction');
+    assert.equal((await emitWithAck(bob, 'direct:reaction:set', {
+      username: 'alice',
+      messageId: sent.message.id,
+      reaction: 'laugh',
+    })).success, true);
+    assert.deepEqual(await reactionEvent, {
+      with: 'bob',
+      messageId: sent.message.id,
+      reactions: [{ reaction: 'laugh', count: 1 }],
+      actor: 'bob',
+      actorReaction: 'laugh',
+    });
+
     assert.equal((await emitWithAck(bob, 'direct:leave', { username: 'alice' })).success, true);
     const beforeSecondMessageCount = bobEvents.length;
     assert.equal((await emitWithAck(alice, 'direct:message:send', {
@@ -240,6 +364,26 @@ describe('Socket.IO chat contract', () => {
       username: 'bob',
       body: 'Sender already left.',
     })).success, false);
+  });
+
+  it('emits inbox conversation availability when mutual follow authorization is established', async () => {
+    const { origin, chatService } = await serverFixture();
+    const alice = await socketClient(origin, 'token-alice');
+    const bob = await socketClient(origin, 'token-bob');
+    const aliceConversation = once(alice, 'direct:conversation');
+    const bobConversation = once(bob, 'direct:conversation');
+    const aliceNotification = once(alice, 'notification:new');
+    const bobNotification = once(bob, 'notification:new');
+
+    await chatService.socialService.onMutualFollow(1, 2, [
+      { userId: 1, notification: { type: 'mutual_follow', targetUsername: 'bob' } },
+      { userId: 2, notification: { type: 'mutual_follow', targetUsername: 'alice' } },
+    ]);
+
+    assert.equal((await aliceConversation).conversation.username, 'bob');
+    assert.equal((await bobConversation).conversation.username, 'alice');
+    assert.equal((await aliceNotification).notification.targetUsername, 'bob');
+    assert.equal((await bobNotification).notification.targetUsername, 'alice');
   });
 
   it('requires room joins, blocks revoked community recipients, and supports leaving', async () => {
@@ -319,6 +463,11 @@ describe('Socket.IO chat contract', () => {
     assert.equal((await emitWithAck(alice, 'community:message:send', {
       community: 'artificial',
       body: 'x'.repeat(2001),
+    })).success, false);
+    assert.equal((await emitWithAck(alice, 'community:reaction:set', {
+      community: 'artificial',
+      messageId: 1,
+      reaction: 'fire',
     })).success, false);
   });
 });
