@@ -173,6 +173,16 @@ function setup(authOverrides = {}, profileOverrides = {}, serviceOverrides = {})
     },
     ...serviceOverrides.chatService,
   };
+  const recommendationService = {
+    async recordEvent(userId, body) {
+      domainCalls.push(['rec-event', userId, body]);
+    },
+    async getHistory(userId) {
+      domainCalls.push(['rec-history', userId]);
+      return { viewedPosts: [], upvotedPosts: [], searchedKeywords: [] };
+    },
+    ...serviceOverrides.recommendationService,
+  };
   const config = createConfig({
     NODE_ENV: 'test',
     FRONTEND_ORIGIN: 'http://localhost:5173',
@@ -189,6 +199,7 @@ function setup(authOverrides = {}, profileOverrides = {}, serviceOverrides = {})
     communityService,
     socialService,
     chatService,
+    recommendationService,
     logger: { error() {} },
     healthService: {
       async check() {
@@ -937,5 +948,117 @@ describe('follow notifications', () => {
     assert.equal(result.notifications[0].targetUsername, 'bob');
     assert.equal(result.notifications[1].targetUsername, 'bob');
     assert.equal(result.notifications[2].targetUsername, null);
+  });
+});
+
+describe('recommendations API', () => {
+  it('POST /api/recommendations/events records a view event for authenticated users', async () => {
+    const { app, domainCalls } = setup();
+    const body = { type: 'view', postId: 42, community: 'technology', flair: 'News', title: 'A post', timestamp: 1234567890 };
+
+    const response = await request(app)
+      .post('/api/recommendations/events')
+      .set('Cookie', 'reddit_session=any-token')
+      .send(body);
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { success: true });
+    assert.deepEqual(domainCalls[0], ['rec-event', 1, body]);
+  });
+
+  it('POST /api/recommendations/events records an upvote event', async () => {
+    const { app, domainCalls } = setup();
+    const body = { type: 'upvote', postId: 7, community: 'science', flair: null, title: 'Another post', timestamp: 9999 };
+
+    const response = await request(app)
+      .post('/api/recommendations/events')
+      .set('Cookie', 'reddit_session=any-token')
+      .send(body);
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { success: true });
+    assert.deepEqual(domainCalls[0], ['rec-event', 1, body]);
+  });
+
+  it('POST /api/recommendations/events records a search event', async () => {
+    const { app, domainCalls } = setup();
+    const body = { type: 'search', keyword: 'vue', timestamp: 1234567890 };
+
+    const response = await request(app)
+      .post('/api/recommendations/events')
+      .set('Cookie', 'reddit_session=any-token')
+      .send(body);
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { success: true });
+    assert.deepEqual(domainCalls[0], ['rec-event', 1, body]);
+  });
+
+  it('POST /api/recommendations/events returns 401 when not logged in', async () => {
+    const { app, domainCalls } = setup();
+
+    const response = await request(app)
+      .post('/api/recommendations/events')
+      .send({ type: 'view', postId: 1, community: 'tech', title: 'Post', timestamp: 0 });
+
+    assert.equal(response.status, 401);
+    assert.equal(response.body.success, false);
+    assert.equal(domainCalls.length, 0);
+  });
+
+  it('GET /api/recommendations/history returns shaped history for authenticated users', async () => {
+    const history = {
+      viewedPosts: [{ id: 1, community: 'technology', flair: null, title: 'A post', timestamp: 1000 }],
+      upvotedPosts: [{ id: 2, community: 'science', flair: 'Research', title: 'B post', timestamp: 2000 }],
+      searchedKeywords: [{ keyword: 'vue', timestamp: 3000 }],
+    };
+    const { app, domainCalls } = setup({}, {}, {
+      recommendationService: {
+        async getHistory(userId) {
+          domainCalls.push(['rec-history', userId]);
+          return history;
+        },
+      },
+    });
+
+    const response = await request(app)
+      .get('/api/recommendations/history')
+      .set('Cookie', 'reddit_session=any-token');
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.success, true);
+    assert.deepEqual(response.body.viewedPosts, history.viewedPosts);
+    assert.deepEqual(response.body.upvotedPosts, history.upvotedPosts);
+    assert.deepEqual(response.body.searchedKeywords, history.searchedKeywords);
+    assert.deepEqual(domainCalls[0], ['rec-history', 1]);
+  });
+
+  it('GET /api/recommendations/history returns 401 when not logged in', async () => {
+    const { app, domainCalls } = setup();
+
+    const response = await request(app).get('/api/recommendations/history');
+
+    assert.equal(response.status, 401);
+    assert.equal(response.body.success, false);
+    assert.equal(domainCalls.length, 0);
+  });
+
+  it('POST /api/recommendations/events returns 400 for invalid event type', async () => {
+    const { app } = setup({}, {}, {
+      recommendationService: {
+        async recordEvent() {
+          const { HttpError: Err } = await import('../src/errors.js');
+          throw new Err(400, "Event type must be 'view', 'upvote', or 'search'.");
+        },
+      },
+    });
+
+    const response = await request(app)
+      .post('/api/recommendations/events')
+      .set('Cookie', 'reddit_session=any-token')
+      .send({ type: 'invalid', timestamp: 0 });
+
+    assert.equal(response.status, 400);
+    assert.equal(response.body.success, false);
   });
 });

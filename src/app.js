@@ -15,6 +15,8 @@ import { HttpError } from './errors.js';
 import { HealthService } from './health.service.js';
 import { createMeRouter, createProfileRouter } from './profile/profile.routes.js';
 import { ProfileService } from './profile/profile.service.js';
+import { createRecommendationRouter } from './recommendations/recommendations.routes.js';
+import { RecommendationService } from './recommendations/recommendations.service.js';
 import { createSocialRouter } from './social/social.routes.js';
 import { SocialService } from './social/social.service.js';
 
@@ -37,6 +39,7 @@ export function createApp({
   communityService,
   socialService,
   chatService,
+  recommendationService,
   logger = console,
 } = {}) {
   const app = express();
@@ -51,6 +54,7 @@ export function createApp({
     resolvedCommunityService,
     resolvedSocialService,
   );
+  const resolvedRecommendationService = recommendationService || new RecommendationService(db);
   const profileReadLimiter = rateLimit({
     windowMs: config.profileReadRateWindowMs,
     limit: config.profileReadRateLimit,
@@ -119,6 +123,14 @@ export function createApp({
     '/api/chats',
     profileReadLimiter,
     createChatRouter({ chatService: resolvedChatService, authService: resolvedAuthService, config }),
+  );
+  app.use(
+    '/api/recommendations',
+    createRecommendationRouter({
+      recommendationService: resolvedRecommendationService,
+      authService: resolvedAuthService,
+      config,
+    }),
   );
   app.use(
     '/api',
