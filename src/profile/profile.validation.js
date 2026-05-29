@@ -49,3 +49,36 @@ export function parseSavedQuery(query) {
   };
 }
 
+export function validateAvatarUpdate(body) {
+  const { avatarUrl = null, originalUrl = null, crop = null } = body ?? {};
+
+  if (avatarUrl !== null) {
+    if (typeof avatarUrl !== 'string' || !/^https:\/\//.test(avatarUrl)) {
+      throw new HttpError(400, 'avatarUrl must be an HTTPS URL or null.');
+    }
+    if (originalUrl === null || typeof originalUrl !== 'string' || !/^https:\/\//.test(originalUrl)) {
+      throw new HttpError(400, 'originalUrl must be an HTTPS URL when avatarUrl is set.');
+    }
+  }
+
+  if (originalUrl !== null && (typeof originalUrl !== 'string' || !/^https:\/\//.test(originalUrl))) {
+    throw new HttpError(400, 'originalUrl must be an HTTPS URL or null.');
+  }
+
+  if (crop !== null) {
+    if (typeof crop !== 'object' || Array.isArray(crop)) {
+      throw new HttpError(400, 'crop must be an object.');
+    }
+    for (const key of ['left', 'top', 'width', 'height']) {
+      if (!Number.isFinite(crop[key]) || crop[key] < 0) {
+        throw new HttpError(400, `crop.${key} must be a non-negative number.`);
+      }
+    }
+    if (crop.width === 0 || crop.height === 0) {
+      throw new HttpError(400, 'crop.width and crop.height must be greater than zero.');
+    }
+  }
+
+  return { avatarUrl, originalUrl, crop };
+}
+

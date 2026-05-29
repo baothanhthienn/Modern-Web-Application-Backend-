@@ -22,6 +22,8 @@ The API provides:
 - Community joining and member-only realtime community chat.
 - Mutual-follow realtime direct chat.
 - Notifications and signed-in username editing.
+- Per-user recommendation event recording and history retrieval.
+- Profile picture upload with crop/zoom metadata persistence and re-edit support.
 - A database health check for deployment verification.
 
 Passwords are hashed on the server with bcrypt. Authentication uses an
@@ -160,6 +162,10 @@ PUT  /api/chats/communities/:name/messages/:messageId/reaction
 DELETE /api/chats/communities/:name/messages/:messageId/reaction
 GET  /api/notifications
 PATCH /api/me/username
+POST /api/recommendations/events
+GET  /api/recommendations/history
+GET  /api/me/avatar
+PATCH /api/me/avatar
 GET  /api/health
 ```
 
@@ -1285,12 +1291,268 @@ Conflict, `409`:
 { "success": false, "error": "That username is already registered." }
 ```
 
+## Profile Avatar API
+
+The backend stores avatar metadata only — it does **not** host image files.
+Images must be uploaded from the browser directly to an external service such
+as [Cloudinary](https://cloudinary.com) (free tier: 25 GB storage / 25 GB
+bandwidth per month). The backend receives and persists only HTTPS URLs and
+crop coordinates.
+
+### Why external hosting
+
+Railway PostgreSQL has no HTTP file-serving capability. Storing binary image
+data in the database would bloat every backup, exceed storage quotas, and
+deliver images far more slowly than a CDN. The URL-based approach is identical
+to how post images already work in this API.
+
+### Recommended frontend upload flow
+
+```
+1. User selects an image file in the browser.
+2. Frontend uploads the ORIGINAL file to Cloudinary (unsigned upload preset).
+   → Receives originalUrl back from Cloudinary.
+3. User zooms and crops using vue-advanced-cropper.
+4. Frontend exports the cropped canvas as a Blob / base64.
+5. Frontend uploads the CROPPED result to Cloudinary.
+   → Receives avatarUrl back from Cloudinary.
+6. Frontend calls PATCH /api/me/avatar with avatarUrl, originalUrl, and crop.
+7. On re-edit: GET /api/me/avatar → load originalUrl into vue-advanced-cropper
+   with the saved crop coordinates to restore the previous edit state.
+```
+
+Both endpoints require a valid authenticated session cookie.
+
+### Get current avatar data
+
+Returns the authenticated user's avatar URLs and saved crop settings. Used to
+pre-populate the re-edit UI.
+
+```http
+GET /api/me/avatar
+```
+
+Success, `200 OK`:
+
+```json
+{
+  "success": true,
+  "avatarUrl": "https://res.cloudinary.com/demo/image/upload/v1/cropped.jpg",
+  "avatarOriginalUrl": "https://res.cloudinary.com/demo/image/upload/v1/original.jpg",
+  "avatarCrop": { "left": 120, "top": 40, "width": 640, "height": 640 }
+}
+```
+
+When no avatar has been set yet, all three values are `null`:
+
+```json
+{
+  "success": true,
+  "avatarUrl": null,
+  "avatarOriginalUrl": null,
+  "avatarCrop": null
+}
+```
+
+No session, `401 Unauthorized`:
+
+```json
+{ "success": false, "error": "You must be logged in." }
+```
+
+### Save or update avatar
+
+Saves the cropped display URL, the original URL for future re-editing, and the
+crop coordinates. Pass `null` for all three fields to clear the avatar.
+
+```http
+PATCH /api/me/avatar
+Content-Type: application/json
+```
+
+**Set or update avatar:**
+
+```json
+{
+  "avatarUrl": "https://res.cloudinary.com/demo/image/upload/v1/cropped.jpg",
+  "originalUrl": "https://res.cloudinary.com/demo/image/upload/v1/original.jpg",
+  "crop": { "left": 120, "top": 40, "width": 640, "height": 640 }
+}
+```
+
+**Clear avatar:**
+
+```json
+{
+  "avatarUrl": null,
+  "originalUrl": null,
+  "crop": null
+}
+```
+
+| Field | Type | Rules |
+| --- | --- | --- |
+| `avatarUrl` | HTTPS string or `null` | The cropped image served publicly on the profile. Required when `originalUrl` is set. |
+| `originalUrl` | HTTPS string or `null` | The unedited original; returned only to the authenticated owner via `GET /api/me/avatar`. Required when `avatarUrl` is set. |
+| `crop` | object or `null` | Coordinates from vue-advanced-cropper. All four numeric fields (`left`, `top`, `width`, `height`) must be non-negative; `width` and `height` must be greater than zero. |
+
+The `crop` object is stored and returned verbatim as JSON. The backend does not
+interpret the coordinate values — the frontend defines the format that
+vue-advanced-cropper uses.
+
+Success, `200 OK` — returns the same shape as `GET /api/me/avatar`:
+
+```json
+{
+  "success": true,
+  "avatarUrl": "https://res.cloudinary.com/demo/image/upload/v1/cropped.jpg",
+  "avatarOriginalUrl": "https://res.cloudinary.com/demo/image/upload/v1/original.jpg",
+  "avatarCrop": { "left": 120, "top": 40, "width": 640, "height": 640 }
+}
+```
+
+Validation failure, `400 Bad Request`:
+
+```json
+{ "success": false, "error": "avatarUrl must be an HTTPS URL or null." }
+```
+
+```json
+{ "success": false, "error": "originalUrl must be an HTTPS URL when avatarUrl is set." }
+```
+
+```json
+{ "success": false, "error": "crop.width must be a non-negative number." }
+```
+
+No session, `401 Unauthorized`:
+
+```json
+{ "success": false, "error": "You must be logged in." }
+```
+
+### Public profile exposure
+
+`avatarUrl` (the cropped display URL) is returned publicly through
+`GET /api/profiles/:username` as `profile.avatarUrl`. The `avatarOriginalUrl`
+and `avatarCrop` fields are **never returned on public profile routes** — they
+are private to the authenticated owner via `GET /api/me/avatar`.
+
+## Recommendations API
+
+These endpoints store and retrieve per-user recommendation signals. Both
+require a valid authenticated session cookie; unauthenticated requests return
+`401`.
+
+### Record a Recommendation Event
+
+```http
+POST /api/recommendations/events
+Content-Type: application/json
+```
+
+Records a single user interaction. Repeated events for the same post or keyword
+are upserted (timestamp refreshed, no duplicate row created), matching the
+"move to front" deduplication behaviour of the client cache.
+
+**View or upvote event:**
+
+```json
+{
+  "type": "view",
+  "postId": 1,
+  "community": "technology",
+  "flair": "Discussion",
+  "title": "Post title here",
+  "timestamp": 1748476800000
+}
+```
+
+**Search event:**
+
+```json
+{
+  "type": "search",
+  "keyword": "vue",
+  "timestamp": 1748476800000
+}
+```
+
+| Field | Type | Required for |
+| --- | --- | --- |
+| `type` | `"view"` \| `"upvote"` \| `"search"` | all |
+| `postId` | integer | `view`, `upvote` |
+| `community` | string | `view`, `upvote` |
+| `flair` | string or `null` | optional, `view`, `upvote` |
+| `title` | string | `view`, `upvote` |
+| `keyword` | string | `search` |
+| `timestamp` | Unix ms integer | optional — stored for debugging only; ordering uses server time |
+
+Success, `200 OK`:
+
+```json
+{ "success": true }
+```
+
+Validation failure, `400 Bad Request`:
+
+```json
+{ "success": false, "error": "postId is required and must be an integer for view/upvote events." }
+```
+
+No session, `401 Unauthorized`:
+
+```json
+{ "success": false, "error": "You must be logged in." }
+```
+
+### Get Recommendation History
+
+```http
+GET /api/recommendations/history
+```
+
+Returns the authenticated user's stored recommendation signals, capped and
+ordered identically to the client-side localStorage cache. The response shape
+is the authoritative source for the frontend `loadHistory()` function.
+
+Success, `200 OK`:
+
+```json
+{
+  "success": true,
+  "viewedPosts": [
+    { "id": 1, "community": "technology", "flair": "Discussion", "title": "Post title here", "timestamp": 1748476800000 }
+  ],
+  "upvotedPosts": [
+    { "id": 2, "community": "programming", "flair": null, "title": "Another post", "timestamp": 1748476700000 }
+  ],
+  "searchedKeywords": [
+    { "keyword": "vue", "timestamp": 1748476600000 }
+  ]
+}
+```
+
+Caps enforced at read time:
+
+| List | Maximum items | Order |
+| --- | --- | --- |
+| `viewedPosts` | 50 | Newest first |
+| `upvotedPosts` | 50 | Newest first |
+| `searchedKeywords` | 20 | Newest first |
+
+No session, `401 Unauthorized`:
+
+```json
+{ "success": false, "error": "You must be logged in." }
+```
+
 ## Database Model
 
 | Table | Purpose |
 | --- | --- |
 | `users`, `auth_sessions` | Existing authentication identity and hashed cookie sessions. |
-| `user_profiles` | Optional public display fields. |
+| `user_profiles` | Optional public display fields, plus `avatar_original_url` and `avatar_crop` (JSONB) for re-edit support — private to the authenticated owner. |
 | `communities` | Public community metadata and seeded community names. |
 | `community_memberships` | Join records; authorization source for community chat. |
 | `posts` | Public post title, description, image URL, community, author, counts, visibility, and time. |
@@ -1302,6 +1564,7 @@ Conflict, `409`:
 | `direct_messages` | Persisted messages between mutually-following users, including recipient `read_at`. |
 | `direct_message_reactions` | Per-user direct-message reactions restricted to five supported values. |
 | `notifications` | Notification page items, including post-created, new-follower, and mutual-follow chat-available events; `related_user_id` identifies the related user when applicable. |
+| `recommendation_events` | Per-user view, upvote, and search signals used for personalised post ranking. Deduplicated by upsert; capped to 50/50/20 at read time. |
 
 ## General Error Responses
 

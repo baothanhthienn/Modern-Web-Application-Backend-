@@ -125,6 +125,35 @@ export class ProfileService {
     };
   }
 
+  async getAvatarData(userId) {
+    const result = await this.db.query(
+      `SELECT avatar_url, avatar_original_url, avatar_crop
+       FROM user_profiles
+       WHERE user_id = $1`,
+      [userId],
+    );
+    const row = result.rows[0];
+    return {
+      avatarUrl: publicAvatarUrl(row?.avatar_url),
+      avatarOriginalUrl: publicAvatarUrl(row?.avatar_original_url),
+      avatarCrop: row?.avatar_crop ?? null,
+    };
+  }
+
+  async updateAvatar(userId, { avatarUrl, originalUrl, crop }) {
+    await this.db.query(
+      `INSERT INTO user_profiles (user_id, avatar_url, avatar_original_url, avatar_crop, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (user_id) DO UPDATE
+         SET avatar_url          = EXCLUDED.avatar_url,
+             avatar_original_url = EXCLUDED.avatar_original_url,
+             avatar_crop         = EXCLUDED.avatar_crop,
+             updated_at          = NOW()`,
+      [userId, avatarUrl, originalUrl, crop !== null ? JSON.stringify(crop) : null],
+    );
+    return this.getAvatarData(userId);
+  }
+
   async saved(userId, { limit, cursor }) {
     const offset = cursorOffset(cursor);
     const result = await this.db.query(

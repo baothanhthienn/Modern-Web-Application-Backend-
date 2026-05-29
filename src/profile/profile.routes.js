@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { HttpError } from '../errors.js';
-import { parseActivityQuery, parseSavedQuery } from './profile.validation.js';
+import { requiredRequestUser } from '../http/request-auth.js';
+import { parseActivityQuery, parseSavedQuery, validateAvatarUpdate } from './profile.validation.js';
 
 function asyncRoute(handler) {
   return (request, response, next) => {
@@ -78,6 +79,19 @@ export function createMeRouter({ profileService, authService, config }) {
     const viewer = await requiredViewer(authService, request.cookies[config.sessionCookieName]);
     const result = await profileService.saved(viewer.id, options);
     response.json({ success: true, ...result });
+  }));
+
+  router.get('/avatar', asyncRoute(async (request, response) => {
+    const viewer = await requiredRequestUser(request, authService, config);
+    const data = await profileService.getAvatarData(viewer.id);
+    response.json({ success: true, ...data });
+  }));
+
+  router.patch('/avatar', asyncRoute(async (request, response) => {
+    const viewer = await requiredRequestUser(request, authService, config);
+    const input = validateAvatarUpdate(request.body);
+    const data = await profileService.updateAvatar(viewer.id, input);
+    response.json({ success: true, ...data });
   }));
 
   return router;
