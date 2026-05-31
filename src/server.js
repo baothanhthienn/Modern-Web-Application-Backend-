@@ -26,6 +26,7 @@ const io = attachSocketServer(server, { config, authService, chatService });
 
 server.listen(config.port, () => {
   console.log(`API listening on port ${config.port}.`);
+  console.log(`Allowed origins: ${config.frontendOrigins.join(', ')}`);
 });
 
 async function shutdown(signal) {
